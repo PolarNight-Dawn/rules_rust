@@ -1,0 +1,11 @@
+[package]
+name = "fastpath_smoke"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "fake.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+path_dep = { path = "path_dep" }

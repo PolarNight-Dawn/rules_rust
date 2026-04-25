@@ -1,0 +1,14 @@
+[package]
+name = "fastpath_regression"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "fake.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+build_helper = { path = "build_helper" }
+git_message = { git = "__GIT_DEP_URL__", rev = "__GIT_DEP_REV__" }
+local_macro = { path = "local_macro" }
+override_dep = { path = "override_dep" }

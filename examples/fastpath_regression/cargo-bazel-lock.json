@@ -1,0 +1,105 @@
+{
+    "facts": {
+        "registry_entries": {
+            "sparse+https://index.crates.io/|anyhow|1.0.102": {
+                "checksum": "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c",
+                "dependencies": [
+                    {
+                        "default_features": false,
+                        "features": [],
+                        "kind": "dev",
+                        "name": "futures",
+                        "optional": false,
+                        "req": "^0.3",
+                        "target": null
+                    },
+                    {
+                        "default_features": true,
+                        "features": [],
+                        "kind": "dev",
+                        "name": "rustversion",
+                        "optional": false,
+                        "req": "^1.0.6",
+                        "target": null
+                    },
+                    {
+                        "default_features": true,
+                        "features": [
+                            "full"
+                        ],
+                        "kind": "dev",
+                        "name": "syn",
+                        "optional": false,
+                        "req": "^2.0",
+                        "target": null
+                    },
+                    {
+                        "default_features": true,
+                        "features": [],
+                        "kind": "dev",
+                        "name": "thiserror",
+                        "optional": false,
+                        "req": "^2",
+                        "target": null
+                    },
+                    {
+                        "default_features": true,
+                        "features": [
+                            "diff"
+                        ],
+                        "kind": "dev",
+                        "name": "trybuild",
+                        "optional": false,
+                        "req": "^1.0.108",
+                        "target": null
+                    }
+                ],
+                "features": {
+                    "backtrace": [],
+                    "default": [
+                        "std"
+                    ],
+                    "std": []
+                },
+                "links": null
+            }
+        },
+        "registry_inspection": {
+            "sparse+https://index.crates.io/|anyhow|1.0.102": {
+                "file_presence": {
+                    "build.rs": true,
+                    "src/lib.rs": true,
+                    "src/main.rs": false
+                },
+                "manifest_info": {
+                    "bin": [],
+                    "lib": {
+                        "name": "anyhow",
+                        "path": "src/lib.rs"
+                    },
+                    "package": {
+                        "authors": "[\"David Tolnay <dtolnay@gmail.com>\"]",
+                        "autobenches": false,
+                        "autobins": false,
+                        "autoexamples": false,
+                        "autolib": false,
+                        "autotests": false,
+                        "build": "build.rs",
+                        "categories": "[",
+                        "description": "Flexible concrete Error type built on std::error::Error",
+                        "documentation": "https://docs.rs/anyhow",
+                        "edition": "2021",
+                        "keywords": "[",
+                        "license": "MIT OR Apache-2.0",
+                        "name": "anyhow",
+                        "readme": "README.md",
+                        "repository": "https://github.com/dtolnay/anyhow",
+                        "rust-version": "1.68",
+                        "version": "1.0.102"
+                    }
+                }
+            }
+        }
+    },
+    "version": 1
+}

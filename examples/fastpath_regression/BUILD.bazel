@@ -1,0 +1,25 @@
+load("@fastpath_regression_index//:defs.bzl", "all_crate_deps")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+cc_library(
+    name = "build_link_dep",
+    srcs = ["build_link_dep.cc"],
+    visibility = ["//visibility:public"],
+)
+
+rust_library(
+    name = "override_dep_impl",
+    srcs = ["override_impl.rs"],
+    crate_name = "override_dep",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "regression_test",
+    srcs = ["test.rs"],
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)

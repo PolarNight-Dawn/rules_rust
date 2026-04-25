@@ -1,0 +1,9 @@
+###############################################################################
+## Bazel Configuration Flags
+###############################################################################
+
+# This smoke test is intentionally validating the WORKSPACE-based fastpath.
+common --noenable_bzlmod --enable_workspace
+
+# Avoid committing a MODULE lockfile created implicitly by Bazel.
+common --lockfile_mode=off

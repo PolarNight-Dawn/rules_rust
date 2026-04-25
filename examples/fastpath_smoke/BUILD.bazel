@@ -1,0 +1,8 @@
+load("@fastpath_smoke_index//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+rust_test(
+    name = "smoke_test",
+    srcs = ["test.rs"],
+    deps = all_crate_deps(),
+)

@@ -2,9 +2,12 @@
 
 load(
     "//crate_universe/private:common_utils.bzl",
+    "REPIN_ALLOWLIST_ENV_VAR",
+    "REPIN_ENV_VARS",
     "get_rust_tools",
     "new_cargo_bazel_fn",
 )
+load("//crate_universe/private:fastpath_resolver.bzl", "fastpath_resolve_and_render")
 load(
     "//crate_universe/private:generate_utils.bzl",
     "CRATES_REPOSITORY_ENVIRON",
@@ -36,15 +39,47 @@ SUPPORTED_PLATFORM_TRIPLES = [
     "x86_64-unknown-nixos-gnu",
 ]
 
+def _is_lockfile_fastpath(repository_ctx):
+    return repository_ctx.attr.resolver_backend == "lockfile_fastpath"
+
+def _repin_requested(repository_ctx):
+    for var in REPIN_ENV_VARS:
+        if var not in repository_ctx.os.environ:
+            continue
+
+        value = repository_ctx.os.environ[var].lower()
+        if value in ["false", "no", "0", "off"]:
+            continue
+
+        if REPIN_ALLOWLIST_ENV_VAR in repository_ctx.os.environ:
+            indices_to_repin = repository_ctx.os.environ[REPIN_ALLOWLIST_ENV_VAR].split(",")
+            if repository_ctx.name not in indices_to_repin:
+                continue
+
+        return True
+
+    return False
+
+def _determine_repin_for_backend(repository_ctx, cargo_bazel_fn, lockfiles, config_path, splicing_manifest):
+    if _is_lockfile_fastpath(repository_ctx):
+        if not lockfiles.bazel:
+            fail("`resolver_backend = \"lockfile_fastpath\"` requires the `lockfile` attribute to be set.")
+
+        return _repin_requested(repository_ctx)
+
+    return determine_repin(
+        repository_ctx = repository_ctx,
+        repository_name = repository_ctx.name,
+        cargo_bazel_fn = cargo_bazel_fn,
+        lockfile_path = lockfiles.bazel,
+        config = config_path,
+        splicing_manifest = splicing_manifest,
+        repin_instructions = repository_ctx.attr.repin_instructions,
+    )
+
 def _crates_repository_impl(repository_ctx):
     # Determine the current host's platform triple
     host_triple = get_host_triple(repository_ctx)
-
-    # Locate the generator to use
-    generator, generator_sha256 = get_generator(repository_ctx, host_triple.str)
-
-    # Generate a config file for all settings
-    config_path = generate_config(repository_ctx)
 
     # Locate the lockfiles
     lockfiles = get_lockfiles(repository_ctx)
@@ -60,88 +95,104 @@ def _crates_repository_impl(repository_ctx):
     tools = get_rust_tools(repository_ctx, host_triple)
     cargo_path = repository_ctx.path(tools.cargo)
     rustc_path = repository_ctx.path(tools.rustc)
-    cargo_bazel_fn = new_cargo_bazel_fn(
-        repository_ctx = repository_ctx,
-        cargo_bazel_path = generator,
-        cargo_path = cargo_path,
-        rustc_path = rustc_path,
-        isolated = repository_ctx.attr.isolated,
-        quiet = repository_ctx.attr.quiet,
-    )
-
-    # Create a manifest of all dependency inputs
-    splicing_manifest = create_splicing_manifest(repository_ctx)
-
-    # Determine whether or not to repin depednencies
-    repin = determine_repin(
-        repository_ctx = repository_ctx,
-        repository_name = repository_ctx.name,
-        cargo_bazel_fn = cargo_bazel_fn,
-        lockfile_path = lockfiles.bazel,
-        config = config_path,
-        splicing_manifest = splicing_manifest,
-        repin_instructions = repository_ctx.attr.repin_instructions,
-    )
-
-    nonhermetic_root_bazel_workspace_dir = repository_ctx.workspace_root
-
-    # If re-pinning is enabled, gather additional inputs for the generator
-    kwargs = dict()
-    if repin:
-        repository_ctx.report_progress("Splicing Cargo workspace.")
-
-        # Generate a top level Cargo workspace and manifest for use in generation
-        splice_outputs = splice_workspace_manifest(
+    generator_sha256 = None
+    if _is_lockfile_fastpath(repository_ctx) and not lockfiles.bazel:
+        fail("`resolver_backend = \"lockfile_fastpath\"` requires the `lockfile` attribute to be set.")
+    if _is_lockfile_fastpath(repository_ctx) and not _repin_requested(repository_ctx):
+        repository_ctx.report_progress("Resolving crates from Cargo.lock via lockfile fastpath.")
+        fastpath_resolve_and_render(
             repository_ctx = repository_ctx,
-            cargo_bazel_fn = cargo_bazel_fn,
-            cargo_lockfile = lockfiles.cargo,
-            splicing_manifest = splicing_manifest,
-            config_path = config_path,
-            output_dir = repository_ctx.path("splicing-output"),
-            skip_cargo_lockfile_overwrite = repository_ctx.attr.skip_cargo_lockfile_overwrite,
-            nonhermetic_root_bazel_workspace_dir = nonhermetic_root_bazel_workspace_dir,
-            repository_name = repository_ctx.name,
+            cargo_path = cargo_path,
+            cargo_lockfile_path = lockfiles.cargo,
+            rustc_path = rustc_path,
+        )
+    else:
+        # Locate the generator to use
+        generator, generator_sha256 = get_generator(repository_ctx, host_triple.str)
+
+        # Generate a config file for all settings
+        config_path = generate_config(repository_ctx)
+
+        cargo_bazel_fn = new_cargo_bazel_fn(
+            repository_ctx = repository_ctx,
+            cargo_bazel_path = generator,
+            cargo_path = cargo_path,
+            rustc_path = rustc_path,
+            isolated = repository_ctx.attr.isolated,
+            quiet = repository_ctx.attr.quiet,
         )
 
-        for path_to_track in splice_outputs.extra_paths_to_track:
-            # We can only watch paths in our workspace.
-            if path_to_track.startswith(str(nonhermetic_root_bazel_workspace_dir)):
-                repository_ctx.watch(path_to_track)
+        # Create a manifest of all dependency inputs
+        splicing_manifest = create_splicing_manifest(repository_ctx)
 
-        kwargs.update({
-            "metadata": splice_outputs.metadata,
-        })
+        # Determine whether or not to repin depednencies
+        repin = _determine_repin_for_backend(
+            repository_ctx = repository_ctx,
+            cargo_bazel_fn = cargo_bazel_fn,
+            lockfiles = lockfiles,
+            config_path = config_path,
+            splicing_manifest = splicing_manifest,
+        )
 
-    paths_to_track_file = repository_ctx.path("paths-to-track")
-    warnings_output_file = repository_ctx.path("warnings-output-file")
+        nonhermetic_root_bazel_workspace_dir = repository_ctx.workspace_root
 
-    # Run the generator
-    repository_ctx.report_progress("Generating crate BUILD files.")
-    execute_generator(
-        cargo_bazel_fn = cargo_bazel_fn,
-        generator_label = repository_ctx.attr.generator,
-        config = config_path,
-        splicing_manifest = splicing_manifest,
-        lockfile_path = lockfiles.bazel,
-        cargo_lockfile_path = lockfiles.cargo,
-        repository_dir = repository_ctx.path("."),
-        nonhermetic_root_bazel_workspace_dir = nonhermetic_root_bazel_workspace_dir,
-        paths_to_track_file = paths_to_track_file,
-        warnings_output_file = warnings_output_file,
-        skip_cargo_lockfile_overwrite = repository_ctx.attr.skip_cargo_lockfile_overwrite,
-        strip_internal_dependencies_from_cargo_lockfile = repository_ctx.attr.strip_internal_dependencies_from_cargo_lockfile,
-        # sysroot = tools.sysroot,
-        **kwargs
-    )
+        # If re-pinning is enabled, gather additional inputs for the generator
+        kwargs = dict()
+        if repin:
+            repository_ctx.report_progress("Splicing Cargo workspace.")
 
-    paths_to_track = json.decode(repository_ctx.read(paths_to_track_file))
-    for path in paths_to_track:
-        repository_ctx.watch(path)
+            # Generate a top level Cargo workspace and manifest for use in generation
+            splice_outputs = splice_workspace_manifest(
+                repository_ctx = repository_ctx,
+                cargo_bazel_fn = cargo_bazel_fn,
+                cargo_lockfile = lockfiles.cargo,
+                splicing_manifest = splicing_manifest,
+                config_path = config_path,
+                output_dir = repository_ctx.path("splicing-output"),
+                skip_cargo_lockfile_overwrite = repository_ctx.attr.skip_cargo_lockfile_overwrite,
+                nonhermetic_root_bazel_workspace_dir = nonhermetic_root_bazel_workspace_dir,
+                repository_name = repository_ctx.name,
+            )
 
-    warnings_output_file = json.decode(repository_ctx.read(warnings_output_file))
-    for warning in warnings_output_file:
-        # buildifier: disable=print
-        print("WARN: {}".format(warning))
+            for path_to_track in splice_outputs.extra_paths_to_track:
+                # We can only watch paths in our workspace.
+                if path_to_track.startswith(str(nonhermetic_root_bazel_workspace_dir)):
+                    repository_ctx.watch(path_to_track)
+
+            kwargs.update({
+                "metadata": splice_outputs.metadata,
+            })
+
+        paths_to_track_file = repository_ctx.path("paths-to-track")
+        warnings_output_file = repository_ctx.path("warnings-output-file")
+
+        # Run the generator
+        repository_ctx.report_progress("Generating crate BUILD files.")
+        execute_generator(
+            cargo_bazel_fn = cargo_bazel_fn,
+            generator_label = repository_ctx.attr.generator,
+            config = config_path,
+            splicing_manifest = splicing_manifest,
+            lockfile_path = lockfiles.bazel,
+            cargo_lockfile_path = lockfiles.cargo,
+            repository_dir = repository_ctx.path("."),
+            nonhermetic_root_bazel_workspace_dir = nonhermetic_root_bazel_workspace_dir,
+            paths_to_track_file = paths_to_track_file,
+            warnings_output_file = warnings_output_file,
+            skip_cargo_lockfile_overwrite = repository_ctx.attr.skip_cargo_lockfile_overwrite,
+            strip_internal_dependencies_from_cargo_lockfile = repository_ctx.attr.strip_internal_dependencies_from_cargo_lockfile,
+            # sysroot = tools.sysroot,
+            **kwargs
+        )
+
+        paths_to_track = json.decode(repository_ctx.read(paths_to_track_file))
+        for path in paths_to_track:
+            repository_ctx.watch(path)
+
+        warnings_output_file = json.decode(repository_ctx.read(warnings_output_file))
+        for warning in warnings_output_file:
+            # buildifier: disable=print
+            print("WARN: {}".format(warning))
 
     # Determine the set of reproducible values
     attrs = {attr: getattr(repository_ctx.attr, attr) for attr in dir(repository_ctx.attr)}
@@ -175,6 +226,7 @@ Environment Variables:
 | `CARGO_BAZEL_GENERATOR_SHA256` | The sha256 checksum of the file located at `CARGO_BAZEL_GENERATOR_URL` |
 | `CARGO_BAZEL_GENERATOR_URL` | The URL of a cargo-bazel binary. This variable takes precedence over attributes and can use `file://` for local paths |
 | `CARGO_BAZEL_ISOLATED` | An authoritative flag as to whether or not the `CARGO_HOME` environment variable should be isolated from the host configuration |
+| `CARGO_BAZEL_FASTPATH_PROFILE` | When set for `resolver_backend = "lockfile_fastpath"`, emit per-phase timings and write `_fastpath_profile.json` into the generated hub repository |
 | `CARGO_BAZEL_REPIN` | An indicator that the dependencies represented by the rule should be regenerated. `REPIN` may also be used. See [Repinning / Updating Dependencies](#repinning--updating-dependencies) for more details. |
 | `CARGO_BAZEL_REPIN_ONLY` | A comma-delimited allowlist for rules to execute repinning. Can be useful if multiple instances of the repository rule are used in a Bazel workspace, but repinning should be limited to one of them. |
 | `CARGO_BAZEL_TIMEOUT` | An integer value to override the default timeout setting when running the cargo-bazel binary. This value must be in seconds. |
@@ -220,6 +272,11 @@ Rust targets found in the dependency graph defined by the given manifests.
 **NOTE**: The `cargo_lockfile` and `lockfile` must be manually created. The rule unfortunately does not yet create
 it on its own. When initially setting up this rule, an empty file should be created and then
 populated by repinning dependencies.
+
+**EXPERIMENTAL**: Setting `resolver_backend = "lockfile_fastpath"` makes WORKSPACE usage behave
+more like a lockfile-driven fast path. The rule trusts the existing `Cargo.lock` plus Bazel
+`lockfile`, skips `cargo-bazel query`, and only performs the more expensive splice flow when
+repinning is explicitly requested.
 
 ### Repinning / Updating Dependencies
 
@@ -346,6 +403,20 @@ CARGO_BAZEL_REPIN=1 CARGO_BAZEL_REPIN_ONLY=crate_index bazel sync --only=crate_i
                 "The configuration flags to use for rendering. Use `//crate_universe:defs.bzl\\%render_config` to " +
                 "generate the value for this field. If unset, the defaults defined there will be used."
             ),
+        ),
+        "resolver_backend": attr.string(
+            doc = (
+                "Selects how dependency metadata is refreshed before rendering. " +
+                "`cargo_bazel` preserves the existing query/splice/generate workflow. " +
+                "`lockfile_fastpath` is an experimental WORKSPACE fast path that trusts the existing " +
+                "`Cargo.lock` and Bazel `lockfile`, skips `cargo-bazel query`, and only falls back to " +
+                "splicing when repinning is explicitly requested."
+            ),
+            default = "cargo_bazel",
+            values = [
+                "cargo_bazel",
+                "lockfile_fastpath",
+            ],
         ),
         "repin_instructions": attr.string(
             doc = "Instructions to re-pin the repository if required. Many people have wrapper scripts for keeping dependencies up to date, and would like to point users to that instead of the default.",

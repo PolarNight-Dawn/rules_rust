@@ -1,0 +1,9 @@
+###############################################################################
+## Bazel Configuration Flags
+###############################################################################
+
+# This regression harness intentionally validates the WORKSPACE-based fastpath.
+common --noenable_bzlmod --enable_workspace
+
+# Avoid committing a MODULE lockfile created implicitly by Bazel.
+common --lockfile_mode=off

@@ -1,0 +1,5 @@
+# Appended via crate.annotation(additive_build_file = ...).
+filegroup(
+    name = "fastpath_anyhow_marker",
+    srcs = ["Cargo.toml"],
+)

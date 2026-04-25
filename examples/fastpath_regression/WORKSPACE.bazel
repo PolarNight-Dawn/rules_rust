@@ -1,0 +1,69 @@
+workspace(name = "fastpath_regression_example")
+
+local_repository(
+    name = "rules_rust",
+    path = "../..",
+)
+
+load("@rules_rust//rust:repositories.bzl", "rules_rust_dependencies", "rust_register_toolchains")
+
+rules_rust_dependencies()
+
+rust_register_toolchains(
+    edition = "2021",
+)
+
+load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
+
+crate_universe_dependencies(bootstrap = True)
+
+load("@rules_rust//crate_universe:defs.bzl", "crate", "crates_repository", "render_config")
+
+crates_repository(
+    name = "fastpath_regression_index",
+    annotations = {
+        "anyhow": [crate.annotation(
+            additive_build_file = "@//:extra_anyhow.BUILD.bazel",
+            compile_data_glob = ["**/*.md"],
+            compile_data_glob_excludes = ["tests/**/*"],
+            data_glob = ["src/**/*.rs"],
+        )],
+        "build_helper": [crate.annotation(
+            build_script_data_glob = ["data/**/*.txt"],
+            build_script_exec_properties = {
+                "fastpath-regression": "1",
+            },
+            build_script_link_deps = ["@//:build_link_dep"],
+            extra_aliased_targets = {
+                "build_script": "build_script_build",
+            },
+        )],
+        "override_dep": [crate.annotation(
+            override_targets = {
+                "lib": "@//:override_dep_impl",
+            },
+        )],
+    },
+    cargo_lockfile = "//:Cargo.lock",
+    generator = "@cargo_bazel_bootstrap//:cargo-bazel",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+    resolver_backend = "lockfile_fastpath",
+)
+
+load("@fastpath_regression_index//:defs.bzl", "crate_repositories")
+
+crate_repositories()
+
+crates_repository(
+    name = "fastpath_regression_render_config_index",
+    cargo_lockfile = "//:Cargo.lock",
+    generator = "@cargo_bazel_bootstrap//:cargo-bazel",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+    render_config = render_config(
+        generate_cargo_toml_env_vars = False,
+        generate_target_compatible_with = False,
+    ),
+    resolver_backend = "lockfile_fastpath",
+)
