@@ -34,7 +34,7 @@ def _fastpath_crate_repository_impl(repository_ctx):
     )
 
 fastpath_crate_repository = repository_rule(
-    doc = "Downloads a crate archive and renders the BUILD file inside the spoke repository.",
+    doc = "Materializes a crate source and renders the BUILD file inside the spoke repository.",
     implementation = _fastpath_crate_repository_impl,
     attrs = {
         "archive": attr.string(

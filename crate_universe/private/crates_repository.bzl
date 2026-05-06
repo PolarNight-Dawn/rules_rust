@@ -33,7 +33,7 @@ load("//rust:defs.bzl", "rust_common")
 load("//rust/platform:triple.bzl", "get_host_triple")
 
 # A reduced subset of platform triples that cover a wide range of known users.
-# The reduced set is intended to speed up the splciing step which has `O(N^2)`
+# The reduced set is intended to speed up the splicing step which has `O(N^2)`
 # complexity for each platform triple added.
 SUPPORTED_PLATFORM_TRIPLES = [
     "aarch64-apple-darwin",

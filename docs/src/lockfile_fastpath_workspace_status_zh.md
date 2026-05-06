@@ -2,242 +2,198 @@
 
 [English version](./lockfile_fastpath_workspace_status_en.md)
 
-这份文档总结当前实验性 `resolver_backend = "lockfile_fastpath"` 在
-WORKSPACE 模式下的状态，主要回答两个问题：
+这份文档记录实验性 `resolver_backend = "lockfile_fastpath"` backend 的当前阶段。
+它是 WORKSPACE fastpath 工作的状态和决策记录。
 
-1. 它是否已经对齐 `rules_rs` 的性能优化思路和策略？
-2. 当前测试和 profiling 覆盖是否已经把基本面覆盖到位？
+设计细节见[概览文档](./lockfile_fastpath_workspace_zh.md)。命令和迁移步骤见
+[迁移手册](./lockfile_fastpath_workspace_guide_zh.md)。
 
-## 1. 与 `rules_rs` 的对齐情况
+## 阶段结论
 
-### 已经对齐的部分
+当前阶段目标已经完成。
 
-当前 WORKSPACE fastpath 已经在最关键的层面上对齐了 `rules_rs` 的性能思路。
+backend 已经从：
 
-- `lockfile-first`：普通 WORKSPACE `sync` 不再走完整的
-  `cargo-bazel query + splice + generate` 链路。
-- repin fastpath：显式 `CARGO_BAZEL_REPIN=1` 直接通过 Cargo 更新或生成
-  `Cargo.lock`，然后回到 fastpath 解图和渲染。
-- 持久化 resolver facts：fastpath facts 默认写入
-  `.cargo-bazel-fastpath-cache/facts/<repo>.json`，如果显式配置了兼容
-  `lockfile` 则继续写入该文件，并可跨 Bazel output root 复用。
-- 持久化 archive cache：registry crate archive 会写入
-  `.cargo-bazel-fastpath-cache/archives`，避免重复下载。
-- hub/spoke 分层：hub repository 负责依赖解图和元数据准备，spoke
-  repository 在本地渲染每个 crate 的 `BUILD.bazel`。
-- sparse index 驱动：registry crate 基于 `Cargo.lock` 和 sparse index
-  数据解析，`git/path` crate 再按需回退到 metadata。
-- 分阶段 profiling：后续做性能回归和瓶颈分析已经有足够细的 phase 数据。
+- `rules_rs`：lockfile-native
+- `rules_rust` fastpath：lockfile-consume fast path + legacy repin fallback
 
-### 还没完全对齐的部分
+推进到：
 
-仍然有一些实现层面的差异，没有做到和 `rules_rs` 一比一。
+- `rules_rs`：lockfile-native
+- `rules_rust` fastpath：lockfile-consume fast path + Cargo-native repin
+  fastpath + unsupported case legacy fallback
 
-- 没有 `module extension` 层的 `mctx.facts`，而是用 sidecar cache，或显式
-  兼容 `lockfile`，来模拟。
-- 没有 extension 层面的异步 downloader 编排；当前 repository rule 已经用
-  非阻塞 `repository_ctx.download` 预取 sparse index 行和 registry archive，
-  但这仍然是 repository rule 内部的局部并行，而不是共享的 module-extension
-  downloader。
-- `cargo metadata --no-deps` 仍然是 workspace metadata 的安全 fallback；
-  但在 `Cargo.lock` 和已记录 workspace manifests 都未变化时，warm sync 已可复用
-  经过校验的 `workspace_metadata` facts cache。
-- hub 侧仍保留少量前置分类逻辑，用于 alias、proc-macro 和 build-script。
-- `git/path` crate 仍然更依赖定向 `cargo metadata` fallback。
-- 依赖 `skip_cargo_lockfile_overwrite` 或
-  `strip_internal_dependencies_from_cargo_lockfile` 的 repin 配置仍走 legacy
-  `cargo_bazel` repin/generate fallback。
+当前实现已经达到这一阶段目标：拿到明显 WORKSPACE 性能收益，同时保持兼容性稳定。
 
-### 在达到预期收益的前提下，剩余部分还有没有必要继续
+## 已完成能力
 
-如果前提是“收益已经达到预期，并优先保证安全、稳定、可维护”，那么这些剩余
-差异目前都不是必须继续追的。
+核心 backend：
 
-当前已经拿到的收益已经足够说明 backend 成立：
+- `crates_repository` 支持 `resolver_backend = "lockfile_fastpath"`。
+- 普通 sync 通过 lockfile fastpath 解图和渲染。
+- supported `CARGO_BAZEL_REPIN=1` 直接通过 Cargo 更新或生成 `Cargo.lock`，
+  然后回到 fastpath render。
+- unsupported repin 配置回退到 legacy `cargo_bazel`。
+- fastpath 支持 same-Cargo-workspace multi-manifest normalization。
+- warm same-Cargo-workspace sync 可以复用经过校验的 `workspace_metadata`
+  facts，避免不必要的 `cargo metadata --no-deps` 重跑。
+- sparse registry facts、registry inspection facts 和 crate archives 可跨
+  Bazel output root 缓存。
+- hub/spoke 渲染把 crate-local inspection 和 BUILD 渲染留在 spoke repository。
+- 通过 `CARGO_BAZEL_FASTPATH_PROFILE=1` 支持分阶段 profiling。
 
-- steady-state cold sync：相对 baseline 提升 `2.895x`
-- steady-state hot sync：相对 baseline 提升 `5.002x`
-- first-generation repin benchmark：相对 baseline 提升 `2.261x`
-- project end-to-end steady-state cold build：本地 Bazel 化 ripgrep 对比里
-  real time 提升 `1.510x`
-- project end-to-end 的 hot no-change build 基本持平；first-generation
-  `CARGO_BAZEL_REPIN=1` sync plus build 在最近一次完整运行里提升 `1.438x`
+实现文件：
 
-在这个前提下，更合理的策略是：
+- `crate_universe/private/crates_repository.bzl`：backend 分流、fastpath repin
+  编排和 legacy fallback 接线
+- `crate_universe/private/fastpath_resolver.bzl`：lockfile-native resolution、
+  same-Cargo-workspace normalization、facts/cache、solver 输入、hub 渲染和
+  profiling
+- `crate_universe/private/fastpath_repo.bzl`：spoke repository rule
+- `crate_universe/private/fastpath_spoke_render.bzl`：crate-local BUILD 渲染
+- `crate_universe/private/fastpath_cfg_parser.bzl`：target `cfg(...)` 解析
+- `crate_universe/private/fastpath_semver.bzl`：semver requirement 匹配
+- `crate_universe/private/fastpath_solver.bzl`：feature/dependency fixpoint
+  solver
+- `crate_universe/private/common_utils.bzl`：共用 execution/environment helpers
+- `crate_universe/private/generate_utils.bzl`：standard backend 和 unsupported
+  fallback 使用的 legacy generator helpers
 
-- 把当前 WORKSPACE fastpath 作为稳定方向收口
-- 先补强文档、回归和防御性逻辑
-- 只有在真实仓库再次出现新瓶颈时，再继续追剩下的差异
+examples 和 harnesses：
 
-### 当前优化姿态
+- `examples/fastpath_smoke`：最小 WORKSPACE smoke
+- `examples/fastpath_regression`：correctness regression 矩阵
+- `examples/fastpath_regression/validate_boundaries.sh`：聚焦边界回归，覆盖
+  workspace metadata cache hit/miss、same-workspace multi-manifest
+  normalization、independent workspace rejection/fallback、supported repin
+  fastpath 和 legacy fallback
+- `examples/fastpath_ripgrep/benchmark.sh`：resolver/sync benchmark 和 warm
+  profile
+- `examples/fastpath_ripgrep/project_e2e.sh`：project end-to-end correctness
+  和 performance benchmark
 
-最新一轮已经通过经过校验的 `workspace_metadata` facts，去掉了 warm
-same-Cargo-workspace manifest normalization 路径上主要的不必要
-`cargo metadata --no-deps` 重跑。hub 侧前置 inspection 也继续保持很薄：
-crate-local 探测留在 spoke repository，hub 只保留 alias、proc-macro、
-build-script 和 links 等必须提前知道的事实。
+## 与 `rules_rs` 的对齐情况
 
-当前 repository-rule-local download prefetching 已经足够支撑这一阶段。更大的
-共享 downloader 模型后续仍可考虑，但风险最高，目前不建议默认继续。
+### 本阶段关键部分已经对齐
 
-## 2. 测试和 profiling 是否覆盖到基本面
+- lockfile-first dependency resolution
+- 持久化 resolver facts
+- 持久化 archive cache
+- sparse-index-driven registry metadata
+- hub/spoke split
+- supported case 的 Cargo-native fastpath repin
+- phase-level profiling
 
-### 正确性回归测试
+### WORKSPACE 特有的实现取舍
 
-当前正确性回归覆盖已经达到预期的基本面。
+- WORKSPACE 使用 sidecar facts，或显式兼容 `lockfile`，而不是 `mctx.facts`。
+  原因：WORKSPACE repository rule 没有 module-extension facts API。
+- 下载编排是 repository-rule-local，而不是共享 module-extension downloader。
+  原因：当前本地 prefetch 模型已经拿到收益，风险更低。
+- `cargo metadata --no-deps` 仍然是 workspace metadata 的权威 fallback。
+  原因：path/git crates、workspace members 和 feature source 信息仍需要 Cargo
+  作为 correctness fallback。
+- hub 保留 alias、proc macro、build script 和 `links` 的最小前置 facts。
+  原因：这些 facts 是生成正确 hub targets 和 aliases 的必要输入。
 
-`examples/fastpath_smoke`
+这些不是“不支持的功能”，而是为了安全适配 WORKSPACE repository rule 保留的实现形态差异。
 
-- 最小可运行 WORKSPACE smoke example
-- 覆盖 `resolver_backend = "lockfile_fastpath"` 的最小 end-to-end 流程
-- 覆盖一个 `path` crate 和一个简单 annotation
+### 当前阶段不纳入范围
 
-`examples/fastpath_regression`
+以下能力未纳入本阶段 fastpath 范围：
 
-- 更完整的 WORKSPACE 回归 example
-- 当前覆盖：
-  - registry crate
-  - `path` crate
-  - `git` crate
-  - `build.rs`
-  - proc-macro crate
-  - `override_targets`
-  - `additive_build_file`
-  - `build_script_link_deps`
-  - `extra_aliased_targets`
-  - `compile_data_glob`
-  - `compile_data_glob_excludes`
-  - `data_glob`
-  - `build_script_data_glob`
-  - `build_script_exec_properties`
-  - `render_config(generate_cargo_toml_env_vars = False, generate_target_compatible_with = False)`
+- 未在一个 `crates_repository.manifests` 中支持混入多个彼此独立的 Cargo
+  workspace。
+  原因：一个 repository rule 应对应一个 Cargo workspace root 和一份 lockfile。
+- 未实现 `packages` 属性的 native fastpath 支持。
+  原因：该路径使用不同的 selection/generate 模型，继续走 legacy
+  `cargo_bazel` 更稳。
+- 未实现 Bzlmod/module-extension 完整对齐。
+  原因：当前阶段专注 WORKSPACE 兼容路径。
+- 未删除 legacy `cargo_bazel` splice/generate。
+  原因：standard backend 和 unsupported repin fallback 仍需要它。
+- 未 fastpath 化依赖 `skip_cargo_lockfile_overwrite` 或
+  `strip_internal_dependencies_from_cargo_lockfile` 的 repin 配置。
+  原因：这些选项带有 legacy lockfile/write-back 语义。
 
-当前本地状态：
+## 验证覆盖
+
+Correctness 覆盖：
+
+- `examples/fastpath_smoke`：最小 fastpath sync 和 test
+- `examples/fastpath_regression/validate.sh`：registry、`path`、`git`、
+  build script、proc macro、overrides、annotations、data/compile_data globs 和
+  render config，并通过 `validate_boundaries.sh` 覆盖小粒度边界检查
+- `examples/fastpath_regression/validate_boundaries.sh`：workspace metadata
+  cache hit/miss、same-Cargo-workspace multi-manifest normalization、
+  independent workspace rejection 和 repin fallback、不依赖 generator 的
+  supported repin fastpath，以及 unsupported repin 设置的 legacy fallback
+- `examples/fastpath_ripgrep/project_e2e.sh correctness`：baseline 和 fastpath
+  都跑：
+  - `bazel query //...`
+  - `bazel build //...`
+  - `bazel run //:rg -- --version`
+  - `bazel test //...`
+
+Performance 覆盖：
+
+- `examples/fastpath_ripgrep/benchmark.sh benchmark`：resolver/sync 的
+  steady-state cold、steady-state hot 和 first-generation repin
+- `examples/fastpath_ripgrep/project_e2e.sh benchmark`：project end-to-end 的
+  steady-state cold、steady-state hot 和 first-generation repin plus build
+- `examples/fastpath_ripgrep/benchmark.sh profile`：warm-cache phase profile
+
+最近一次记录的本地状态：
 
 - `examples/fastpath_regression/validate.sh`：通过
-
-### Resolver/sync benchmark
-
-resolver/sync benchmark 当前由 `examples/fastpath_ripgrep/benchmark.sh`
-提供。它在隔离生成的 WORKSPACE harness 中测 dependency resolution 和 repository
-generation 行为。
-
-这个 harness 已经把两个 backend 拆到彼此独立的 WORKSPACE 里：
-
-- fastpath backend
-- baseline `cargo_bazel` backend
-
-这样可以避免互相污染，保证 benchmark 结果可信。
-
-当前基准结果由 `examples/fastpath_ripgrep/benchmark.sh benchmark` 产出，使用
-`RIPGREP_DIR=/Users/dengjiahong/repo/ripgrep`：
-
-- steady-state cold
-  - fastpath 中位数：`24630ms`
-  - cargo_bazel 中位数：`71300ms`
-  - speedup：`2.895x`
-- steady-state hot
-  - fastpath 中位数：`10810ms`
-  - cargo_bazel 中位数：`54070ms`
-  - speedup：`5.002x`
-- first-generation repin
-  - fastpath 中位数：`31840ms`
-  - cargo_bazel 中位数：`71990ms`
-  - speedup：`2.261x`
-
-当前本地状态：
-
+- `examples/fastpath_regression/validate_boundaries.sh`：通过
 - `examples/fastpath_ripgrep/benchmark.sh validate`：通过
 - `examples/fastpath_ripgrep/benchmark.sh profile`：通过
 - `examples/fastpath_ripgrep/benchmark.sh benchmark`：通过
 - `examples/fastpath_ripgrep/project_e2e.sh correctness`：通过
 - `examples/fastpath_ripgrep/project_e2e.sh benchmark`：通过
 
-### Project end-to-end benchmark
+## 已记录结果
 
-project end-to-end benchmark 由
-`examples/fastpath_ripgrep/project_e2e.sh` 提供。它直接对比本地 checkout：
+Resolver/sync benchmark，使用
+`RIPGREP_DIR=/Users/dengjiahong/repo/ripgrep`：
+
+| scenario | fastpath | cargo_bazel baseline | speedup |
+| --- | ---: | ---: | ---: |
+| steady-state cold sync | `24630ms` | `71300ms` | `2.895x` |
+| steady-state hot sync | `10810ms` | `54070ms` | `5.002x` |
+| first-generation repin | `31840ms` | `71990ms` | `2.261x` |
+
+Project end-to-end benchmark：
 
 - baseline：`/Users/dengjiahong/repo/ripgrep_baseline` 加
   `/Users/dengjiahong/repo/rules_rust_baseline`
 - fastpath：`/Users/dengjiahong/repo/ripgrep` 加
   `/Users/dengjiahong/repo/rules_rust`
-
-两边都向 `crates_repository` 传入同一组 10 个 ripgrep workspace manifest；
-这是 same-Cargo-workspace manifest normalization 场景。fastpath 会确认每个
-manifest 都属于同一个 Cargo workspace，归一到该 workspace root，再从 root
-manifest 渲染。这个 benchmark 不表示支持把多个彼此独立的 Cargo workspace
-混在同一个 `crates_repository.manifests` 列表里。
-
-两边运行条件一致：
-
+- 两边都传入同一组 10 个 same-Cargo-workspace ripgrep manifests
 - `USE_BAZEL_VERSION=7.4.1`
 - `--noenable_bzlmod --enable_workspace`
 - `.bazelrc` 选择 stable Rust toolchain
-- 每次 build 前清空 Bazel output cache
 
-完整 correctness 覆盖会在 baseline 和 fastpath 两边都跑：
-
-- `bazel query //...`
-- `bazel build //...`
-- `bazel run //:rg -- --version`
-- `bazel test //...`
-
-这覆盖 target 完整性、全项目 build、binary 可执行性、测试套件，以及 fastpath
-切换是否破坏传统 `cargo_bazel` 能 build 的项目。
-
-完整 performance 覆盖对齐 resolver/sync benchmark 的形态：
-
-- `steady_state cold`：保留依赖 facts/lock/cache，清 Bazel output cache，然后计时
-  `bazel build //...`
-- `steady_state hot`：不清 Bazel output cache，连续计时无改动
-  `bazel build //...`
-- `first_gen repin`：清 fastpath facts/archive cache 或 baseline lockfile 生成状态，
-  跑 `CARGO_BAZEL_REPIN=1 bazel sync --only=crate_index`，再计时
-  `bazel build //...`
-
-脚本会在 repin 计时前后备份并恢复 first-generation 状态，包括 fastpath 的
-`Cargo.lock` 和 fastpath cache，避免本地项目 checkout 残留重新生成的
-lockfile 或 cache。
-
-当前已记录的 project benchmark 结果：
-
-| 指标 | baseline | fastpath | 差值 |
+| metric | baseline | fastpath | delta |
 | --- | ---: | ---: | ---: |
-| steady-state cold build real time | `122.24s` | `80.95s` | `-41.29s` |
-| steady-state hot build 中位数 | `2.68s` | `2.84s` | `+0.16s` |
+| steady-state cold `bazel build //...` real time | `122.24s` | `80.95s` | `-41.29s` |
+| steady-state hot `bazel build //...` median | `2.68s` | `2.84s` | `+0.16s` |
 | first-gen repin sync | `76.09s` | `38.93s` | `-37.16s` |
 | first-gen repin build | `61.25s` | `56.55s` | `-4.70s` |
 | first-gen repin sync plus build | `137.34s` | `95.48s` | `-41.86s` |
 
-解读：project end-to-end 的冷启动收益主要来自 repository resolution/loading。
-两边最终构建的是同一个项目目标和 action 集合；hot no-change build 基本持平。
-first-gen repin 现在使用 Cargo-native fastpath 渲染，supported fastpath
-路径不再支付 cargo-bazel generator/bootstrap 成本。
+解读：
 
-### 分阶段 profiling
+- Resolver/sync 收益大，是因为 fastpath 避免完整
+  `cargo-bazel query + splice + generate`。
+- Project cold build 收益主要来自 repository resolution/loading。
+- Hot no-change project build 基本持平，因为两边最终构建同一组 project targets
+  和 actions。
+- First-generation repin 在 supported fastpath 路径上更快，因为不再支付
+  cargo-bazel generator/bootstrap 成本。
 
-当前 profiling 已经覆盖了预期里的关键阶段。
-
-已覆盖 phase：
-
-- `cargo_metadata_no_deps`
-- `cargo_metadata_full`
-- `download_registry_metadata`
-- `inspect_external_crates`
-- `write_root_build_bazel`
-- `write_data_bzl`
-- `write_defs_bzl`
-
-这和要求的 profiling 维度是一一对应的：
-
-- `cargo metadata --no-deps`：已覆盖
-- 可选的 full metadata：已覆盖
-- sparse index 下载：已覆盖
-- crate manifest inspect：已覆盖
-- BUILD/data/defs 渲染：已覆盖，而且已经拆分成三个独立 phase
-
-最近一次 warm-cache profile 来自 `examples/fastpath_ripgrep/benchmark.sh profile`：
+最近一次 warm-cache profile：
 
 - `total = 640.864ms`
 - `cargo_metadata_no_deps = 25.089ms`，其中 `cache_hit = True` 且
@@ -248,10 +204,13 @@ first-gen repin 现在使用 Cargo-native fastpath 渲染，supported fastpath
 - `write_data_bzl = 23.398ms`
 - `write_defs_bzl = 17.972ms`
 
-## 结论
+## 下一阶段
 
-从实际收益、实现结构、回归覆盖和 profiling 粒度来看，当前 WORKSPACE
-fastpath 已经在实用层面完成了对 `rules_rs` 性能思路的对齐。
+建议下一阶段目标：PR-ready hardening 和 upstreaming preparation。
 
-剩余未完全对齐的部分，更多是实现形式差异或高风险优化项，而不是当前阶段的
-能力缺口。就现在这个阶段来说，基本面已经覆盖到位，符合预期。
+具体工作：
+
+- 决定哪些 smoke/regression 检查进入 CI，包括新的小粒度边界回归。
+- 决定 ripgrep resolver/sync 和 project end-to-end benchmark 的运行频率。
+- 准备 upstream PR 描述、迁移说明、风险说明和 fallback 解释。
+- 决定当前工作是否拆成更易 review 的 commits。

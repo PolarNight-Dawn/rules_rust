@@ -25,6 +25,12 @@
   - `build_script_exec_properties`
 - `render_config(generate_cargo_toml_env_vars = False, generate_target_compatible_with = False)`
 - 通过 `CARGO_BAZEL_FASTPATH_PROFILE=1` 启用的 fastpath 分阶段 profiling
+- 小粒度 fastpath 边界覆盖：
+  - workspace metadata cache hit/miss
+  - same-Cargo-workspace multi-manifest normalization
+  - independent workspace rejection 和 repin fallback
+  - 不依赖 cargo-bazel generator 的 supported repin fastpath
+  - unsupported repin 设置的 legacy fallback
 
 执行方式：
 
@@ -32,6 +38,9 @@
 cd examples/fastpath_regression
 ./validate.sh
 ```
+
+`validate.sh` 也会运行 `validate_boundaries.sh`。如果只需要较小的边界检查，可以
+直接运行该脚本。
 
 常用覆盖项：
 

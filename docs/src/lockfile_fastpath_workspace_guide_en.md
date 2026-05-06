@@ -2,73 +2,37 @@
 
 [中文版本](./lockfile_fastpath_workspace_guide_zh.md)
 
-This guide is for two audiences:
+This guide explains how to enable, validate, and roll back
+`resolver_backend = "lockfile_fastpath"` in a WORKSPACE project. It also lists
+what a `rules_rust` fork must carry to keep the backend working.
 
-- maintainers of a `rules_rust` fork who want to carry the WORKSPACE fastpath
-  backend forward
-- projects that want to consume that fork and migrate their WORKSPACE-based
-  dependency flow to `resolver_backend = "lockfile_fastpath"`
+For the runtime model, see [the overview](./lockfile_fastpath_workspace.md).
+For current results and next-phase work, see
+[the status document](./lockfile_fastpath_workspace_status_en.md).
 
-## 1. What This Backend Changes
+## Quick Decision
 
-The WORKSPACE fastpath keeps the existing `crates_repository` API surface, but
-changes how normal syncs are resolved.
+Use the fastpath when the repository has:
 
-Instead of always using the full `cargo-bazel query + splice + generate`
-pipeline, the fastpath backend uses:
+- a WORKSPACE `crates_repository`
+- a checked-in `Cargo.lock`
+- `manifests` pointing at either one Cargo workspace root or multiple members
+  of the same Cargo workspace
+- normal dependency updates that can be represented by Cargo updating or
+  generating `Cargo.lock`
 
-- `Cargo.lock`
-- `cargo metadata --no-deps`
-- sparse index metadata
-- targeted fallbacks for `git` and `path` crates
+Use the legacy backend, or expect fallback, when the repository depends on:
 
-The steady-state goal is to keep lockfiles authoritative and make normal
-WORKSPACE syncs cheap.
+- `packages`
+- multiple independent Cargo workspaces inside one `crates_repository`
+- `skip_cargo_lockfile_overwrite`
+- `strip_internal_dependencies_from_cargo_lockfile`
+- other behavior that requires legacy `cargo_bazel` generate semantics
 
-## 2. Code Areas To Carry In A Fork
+## Enable In A Project
 
-If another `rules_rust` fork wants this backend, the main implementation lives
-in the following files:
-
-- `crate_universe/private/crates_repository.bzl`: backend selection, fastpath
-  repin orchestration, and legacy fallback wiring.
-- `crate_universe/private/fastpath_resolver.bzl`: lockfile-native resolution,
-  same-Cargo-workspace manifest normalization, validated workspace metadata
-  caching, sparse registry facts, feature solving inputs, and hub rendering.
-- `crate_universe/private/fastpath_repo.bzl`: spoke repository rule that
-  materializes crate sources and delegates local BUILD rendering.
-- `crate_universe/private/fastpath_spoke_render.bzl`: crate-local BUILD
-  rendering for libraries, binaries, build scripts, annotations, and render
-  config knobs.
-- `crate_universe/private/fastpath_cfg_parser.bzl`: target `cfg(...)`
-  parsing used for platform-specific dependencies.
-- `crate_universe/private/fastpath_semver.bzl`: semver requirement matching
-  used when resolving dependency versions from the lockfile graph.
-- `crate_universe/private/fastpath_solver.bzl`: feature/dependency fixpoint
-  solver.
-
-Supporting updates also exist in:
-
-- `crate_universe/private/common_utils.bzl`: shared execution/environment
-  utilities reused by the fastpath flow.
-- `crate_universe/private/generate_utils.bzl`: shared generator helpers kept
-  for the legacy `cargo_bazel` path and unsupported fallback cases.
-
-Examples and docs to carry with it:
-
-- `examples/fastpath_smoke`
-- `examples/fastpath_regression`
-- `examples/fastpath_ripgrep`
-- `docs/src/lockfile_fastpath_workspace.md`
-- `docs/src/lockfile_fastpath_workspace_zh.md`
-- `docs/src/lockfile_fastpath_workspace_status_en.md`
-- `docs/src/lockfile_fastpath_workspace_status_zh.md`
-- `docs/src/lockfile_fastpath_workspace_guide_en.md`
-- `docs/src/lockfile_fastpath_workspace_guide_zh.md`
-
-## 3. How To Enable It In A Project
-
-In a WORKSPACE-based project, use `crates_repository` as usual and set:
+Set `resolver_backend = "lockfile_fastpath"` on the target
+`crates_repository`.
 
 ```python
 crates_repository(
@@ -83,109 +47,103 @@ Required inputs:
 
 - a checked-in `Cargo.lock`
 - either one workspace-root manifest or multiple same-Cargo-workspace member
-  manifests passed through `manifests`
-
-The multi-manifest case is intentionally narrow. When multiple manifests are
-listed, fastpath performs same-Cargo-workspace manifest normalization: it uses
-`cargo metadata --no-deps` to verify that every listed manifest is a member of
-one Cargo workspace, then renders from the normalized workspace root manifest.
-This keeps compatibility with existing `cargo_bazel` projects that list every
-member crate, without opening support for multiple independent Cargo workspaces
-inside one `crates_repository.manifests` list.
+  manifests
 
 Optional compatibility input:
 
-- `lockfile = "//:cargo-bazel-lock-fastpath.json"` may still be set to keep
-  storing fastpath facts in an existing Bazel lockfile-style cache
+- `lockfile = "//:cargo-bazel-lock-fastpath.json"` if the project wants
+  fastpath facts stored in a Bazel lockfile-style file
 
-Important behavior:
+For new migrations, the `lockfile` attribute is optional. Without it, facts are
+stored under `.cargo-bazel-fastpath-cache/facts/<repo>.json`.
 
-- normal syncs use the fastpath backend
-- `CARGO_BAZEL_REPIN=1` uses the repin fastpath by default: Cargo updates or
-  generates `Cargo.lock`, then fastpath consumes the updated lockfile
-- a cargo-bazel generator is not required for supported fastpath repins
-- the legacy `cargo_bazel` repin/generate flow remains the fallback for
-  configurations that still require cargo-bazel generate semantics
+## Multi-Manifest Rule
 
-## 4. Expected Cache Files
+Multiple manifests are supported only as same-Cargo-workspace normalization.
+Fastpath runs `cargo metadata --no-deps`, verifies that every listed manifest is
+a member of the same Cargo workspace, then renders from the normalized
+workspace-root manifest.
 
-After the first successful sync, the workspace will contain:
+This supports traditional `cargo_bazel` projects that list every member crate.
+Fastpath does not support combining multiple independent Cargo workspaces in
+one `crates_repository.manifests` list.
 
-- `.cargo-bazel-fastpath-cache/facts/<repo>.json`
-- `.cargo-bazel-fastpath-cache/archives/`
+Reason: one repository rule should represent one Cargo workspace root and one
+lockfile. Use separate `crates_repository` instances for independent Cargo
+workspaces.
 
-What they do:
+## Sync And Repin Behavior
 
-- `.cargo-bazel-fastpath-cache/facts/<repo>.json`
-  - stores fastpath facts
-  - caches reduced sparse index entries, registry inspection facts, and
-    validated workspace metadata for same-Cargo-workspace manifest
-    normalization
-- an explicit `lockfile = "//:..."` overrides this facts cache path for
-  compatibility
-- `.cargo-bazel-fastpath-cache/archives`
-  - stores registry crate archives
-  - allows reuse across Bazel output roots
-
-Both caches are advisory. Deleting them is safe and only slows down the next
-sync.
-
-The workspace metadata cache is reused only when the recorded `Cargo.lock`,
-workspace-root manifest, and recorded workspace member manifests still match
-the current files. Otherwise fastpath reruns `cargo metadata --no-deps` and
-rewrites the cache.
-
-## 5. Migration Checklist For A Project Repo
-
-1. Ensure the repo already has a stable WORKSPACE `crate_universe` flow.
-2. Check in a `Cargo.lock` if it is not already tracked.
-3. Set `resolver_backend = "lockfile_fastpath"` on the target
-   `crates_repository`.
-4. If the repository passes multiple manifests, keep that list limited to
-   member manifests of one Cargo workspace. Use separate `crates_repository`
-   instances for independent Cargo workspaces.
-5. If the repository uses a repin configuration that still needs the legacy
-   fallback, keep a usable cargo-bazel generator configured for that fallback.
-6. Run:
+Normal sync:
 
 ```bash
 bazel sync --only=<repo_name>
 ```
 
-7. If needed, run a fastpath repin once. Supported repin requests update or
-   generate `Cargo.lock` with Cargo and then render through fastpath; only
-   unsupported repin configurations use the legacy `cargo_bazel` fallback.
+With `resolver_backend = "lockfile_fastpath"`, normal sync resolves from the
+checked-in `Cargo.lock` and fastpath facts.
+
+Supported repin:
 
 ```bash
 CARGO_BAZEL_REPIN=1 bazel sync --only=<repo_name>
 ```
 
-8. Commit:
-   - the WORKSPACE changes
-   - any intentionally checked-in fastpath facts cache, if the project wants a
-     warm first sync in CI
-   - any updated `Cargo.lock` content from the repin fastpath
-   - any regenerated Bazel lockfile content if a legacy fallback repin was used
+Supported repin requests:
 
-## 6. Migration Checklist For A Fork Maintainer
+- parse the repin request
+- update or generate `Cargo.lock` with Cargo
+- run `cargo fetch`
+- write back the workspace `Cargo.lock`
+- refresh stale fastpath facts as needed
+- render through fastpath
 
-1. Bring over the fastpath implementation files.
-2. Keep `crates_repository.bzl` wired so:
-   - fastpath is used for normal syncs and supported repins when
-     `resolver_backend` is `"lockfile_fastpath"`
-   - explicit repin requests update or generate `Cargo.lock` through Cargo and
-     then return to fastpath rendering
-   - the legacy `cargo_bazel` repin/generate path remains available for
-     unsupported repin configurations
-3. Carry the examples and docs with the implementation.
-4. Run the correctness regression suite.
-5. Run the ripgrep benchmark harness before publishing the fork.
+Supported fastpath repins do not require a cargo-bazel generator.
 
-## 7. Validation Workflow
+Unsupported repin configurations fall back to legacy `cargo_bazel`
+repin/generate. Keep a usable generator configured if the project relies on
+those fallback configurations.
 
-Recommended validation order:
+## Expected Cache Files
 
-### Minimal smoke
+After the first successful sync, the workspace may contain:
+
+- `.cargo-bazel-fastpath-cache/facts/<repo>.json`
+- `.cargo-bazel-fastpath-cache/archives/`
+
+The facts file stores sparse registry facts, registry inspection facts, and
+validated workspace metadata facts. The archive directory stores registry crate
+archives for reuse across Bazel output roots.
+
+These caches are advisory. Deleting them is safe; the next sync will recompute
+or re-download what it needs.
+
+Workspace metadata facts are reused only when the recorded `Cargo.lock`, the
+workspace-root manifest, and every recorded workspace member manifest still
+match the current files.
+
+## Project Migration Checklist
+
+1. Confirm the existing WORKSPACE `crate_universe` flow is healthy.
+2. Check in `Cargo.lock` if it is not already tracked.
+3. Add `resolver_backend = "lockfile_fastpath"` to the target
+   `crates_repository`.
+4. If multiple manifests are passed, ensure they all belong to the same Cargo
+   workspace.
+5. Keep a cargo-bazel generator configured if the repository uses repin
+   settings that remain outside the fastpath and therefore need fallback.
+6. Run `bazel sync --only=<repo_name>`.
+7. Run a supported repin if needed with
+   `CARGO_BAZEL_REPIN=1 bazel sync --only=<repo_name>`.
+8. Commit the WORKSPACE changes and any `Cargo.lock` updates from the repin.
+9. Commit fastpath facts only if the project intentionally wants warm first
+   syncs in CI.
+10. If a legacy fallback repin was used, commit the regenerated Bazel lockfile
+    content as usual.
+
+## Validation Workflow
+
+Recommended order:
 
 ```bash
 cd examples/fastpath_smoke
@@ -193,121 +151,117 @@ bazel sync --only=fastpath_smoke_index
 bazel test //:smoke_test
 ```
 
-### Correctness regression
-
 ```bash
 cd examples/fastpath_regression
 ./validate.sh
 ```
 
-### Fastpath profiling
+`validate.sh` includes the focused boundary regression. To run only that
+smaller check:
+
+```bash
+cd examples/fastpath_regression
+./validate_boundaries.sh
+```
 
 ```bash
 cd examples/fastpath_ripgrep
 ./benchmark.sh prepare
-./benchmark.sh profile
-```
-
-### Resolver/sync benchmark
-
-```bash
-cd examples/fastpath_ripgrep
 ./benchmark.sh validate
+./benchmark.sh profile
 ./benchmark.sh benchmark
 ```
 
-### Project end-to-end correctness
-
-For the local Bazelized ripgrep checkouts, run the compatibility checks against
-both the baseline `cargo_bazel` setup and the fastpath setup:
+For local Bazelized ripgrep checkouts:
 
 ```bash
 cd examples/fastpath_ripgrep
 ./project_e2e.sh correctness
-```
-
-This covers:
-
-- target completeness with `bazel query //...`
-- full-project build behavior with `bazel build //...`
-- binary execution with `bazel run //:rg -- --version`
-- test-suite behavior with `bazel test //...`
-- whether fastpath breaks a project that already builds with the traditional
-  `cargo_bazel` backend
-
-### Project end-to-end benchmark
-
-For project-level timing, use:
-
-```bash
-cd examples/fastpath_ripgrep
 ./project_e2e.sh benchmark
 ```
 
-It records:
+`project_e2e.sh correctness` runs these commands for both baseline and
+fastpath:
 
-- `steady_state cold`: keep dependency facts/lock/cache, clear the Bazel output
+- `bazel query //...`
+- `bazel build //...`
+- `bazel run //:rg -- --version`
+- `bazel test //...`
+
+`project_e2e.sh benchmark` records:
+
+- `steady_state cold`: keep dependency facts/lock/cache, clear Bazel output
   cache, then time `bazel build //...`
-- `steady_state hot`: keep the Bazel output cache warm and repeatedly time
-  no-change `bazel build //...`
+- `steady_state hot`: keep Bazel output cache warm and time no-change
+  `bazel build //...`
 - `first_gen repin`: clear fastpath facts/archive cache or baseline lockfile
   generation state, run `CARGO_BAZEL_REPIN=1 bazel sync --only=crate_index`,
   then time `bazel build //...`
 
-The script keeps the Bazel version and flags consistent across both sides and
-writes Bazel profiles for measured build steps.
+## Reading Profiles
 
-## 8. How To Read The Profile Output
-
-Set:
+Enable profiling with:
 
 ```bash
 CARGO_BAZEL_FASTPATH_PROFILE=1
 ```
 
-The hub repository will emit `_fastpath_profile.json`.
+The hub repository writes `_fastpath_profile.json`.
 
-The most important phases are:
+Start with these phases:
 
-- `cargo_metadata_no_deps`
-- `cargo_metadata_full`
-- `download_registry_metadata`
-- `inspect_external_crates`
-- `prepare_spoke_render_metadata`
-- `render_hub_repo_metadata`
-- `write_root_build_bazel`
-- `write_data_bzl`
-- `write_defs_bzl`
+- `cargo_metadata_no_deps`: workspace metadata load or cache hit
+- `cargo_metadata_full`: targeted fallback for `git`/`path` crates
+- `download_registry_metadata`: sparse registry facts
+- `inspect_external_crates`: registry inspection facts
+- `prepare_spoke_render_metadata`: spoke metadata preparation
+- `render_hub_repo_metadata`: in-memory hub rendering
+- `write_root_build_bazel`, `write_data_bzl`, `write_defs_bzl`: hub output
+  writes split by file family
 
-Interpretation tips:
+## Rollback
 
-- high `cargo_metadata_full` usually means `git` or `path` fallback work
-- high `download_registry_metadata` means sparse facts are not warm yet
-- high `inspect_external_crates` means registry inspection facts are not warm
-- high `write_*` phases indicate hub rendering work, now split by file family
+To roll back a project:
 
-## 9. Rollback And Safety
-
-If a migration needs to be rolled back:
-
-1. remove `resolver_backend = "lockfile_fastpath"`
-2. keep using the existing standard `cargo_bazel` flow
-3. optionally delete:
+1. Remove `resolver_backend = "lockfile_fastpath"`.
+2. Return to the existing `cargo_bazel` configuration.
+3. Optionally delete:
    - `.cargo-bazel-fastpath-cache/facts/<repo>.json`
    - `.cargo-bazel-fastpath-cache/archives`
 
-This rollback is straightforward because the fastpath caches are not the source
-of truth for dependency selection.
+Fastpath caches are not the source of truth for dependency selection, so
+deleting them does not change correctness.
 
-## 10. Current Recommended Operating Mode
+## Fork Maintainer Checklist
 
-For most projects, the recommended operating mode is:
+Carry these implementation files together:
 
-- use fastpath for normal WORKSPACE syncs
-- use Cargo-native fastpath rendering when updating dependencies
-- keep legacy repin/generate fallback available for unsupported repin modes
-- keep the ripgrep harness or an equivalent real-repo benchmark available for
-  regression checks
+- `crate_universe/private/crates_repository.bzl`
+- `crate_universe/private/fastpath_resolver.bzl`
+- `crate_universe/private/fastpath_repo.bzl`
+- `crate_universe/private/fastpath_spoke_render.bzl`
+- `crate_universe/private/fastpath_cfg_parser.bzl`
+- `crate_universe/private/fastpath_semver.bzl`
+- `crate_universe/private/fastpath_solver.bzl`
+- `crate_universe/private/common_utils.bzl`
+- `crate_universe/private/generate_utils.bzl`
 
-That gives the performance benefit without requiring riskier implementation
-changes beyond the repository-rule-local prefetching already in place.
+Carry these examples and docs:
+
+- `examples/fastpath_smoke`
+- `examples/fastpath_regression`
+- `examples/fastpath_ripgrep`
+- `docs/src/lockfile_fastpath_workspace.md`
+- `docs/src/lockfile_fastpath_workspace_zh.md`
+- `docs/src/lockfile_fastpath_workspace_status_en.md`
+- `docs/src/lockfile_fastpath_workspace_status_zh.md`
+- `docs/src/lockfile_fastpath_workspace_guide_en.md`
+- `docs/src/lockfile_fastpath_workspace_guide_zh.md`
+
+Before publishing a fork:
+
+1. Run the smoke and regression checks.
+2. Run the ripgrep resolver/sync benchmark.
+3. Run the ripgrep project end-to-end correctness flow if the local checkouts
+   are available.
+4. Confirm unsupported repin cases still fall back to legacy `cargo_bazel`.

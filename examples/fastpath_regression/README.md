@@ -22,6 +22,12 @@ It covers:
   `build_script_data_glob`, and `build_script_exec_properties`
 - `render_config(generate_cargo_toml_env_vars = False, generate_target_compatible_with = False)`
 - fastpath per-phase profiling via `CARGO_BAZEL_FASTPATH_PROFILE=1`
+- fine-grained fastpath boundary coverage:
+  - workspace metadata cache hit/miss behavior
+  - same-Cargo-workspace multi-manifest normalization
+  - independent workspace rejection and repin fallback
+  - supported repin fastpath without a cargo-bazel generator
+  - legacy fallback for unsupported repin settings
 
 Run it with:
 
@@ -29,6 +35,9 @@ Run it with:
 cd examples/fastpath_regression
 ./validate.sh
 ```
+
+`validate.sh` also runs `validate_boundaries.sh`. Run that script directly when
+you only need the smaller boundary checks.
 
 Helpful overrides:
 

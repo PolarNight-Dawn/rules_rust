@@ -141,4 +141,6 @@ if not summary["full_metadata_used"]:
     raise SystemExit("expected fastpath regression to require full cargo metadata")
 PY
 
+BAZEL="${BAZEL}" BAZEL_BATCH="${BAZEL_BATCH}" "${ROOT}/validate_boundaries.sh"
+
 echo "fastpath regression validation passed"
