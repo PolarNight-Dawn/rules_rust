@@ -7,6 +7,7 @@ path against a broader matrix than the minimal smoke test.
 
 It covers:
 
+- a single workspace-root manifest input
 - registry crates
 - path crates
 - a git crate backed by a temporary local git repository

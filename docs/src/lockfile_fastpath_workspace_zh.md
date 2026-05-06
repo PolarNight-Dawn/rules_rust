@@ -5,8 +5,10 @@
 实验性的 `resolver_backend = "lockfile_fastpath"` 会让 WORKSPACE 下的
 `crate_universe` 更接近一个以 lockfile 为中心的 resolver。它不会在每次
 同步时都执行完整的 `cargo-bazel query + splice + generate` 链路，而是优先
-信任现有的 `Cargo.lock` 和 Bazel lockfile，直接从 lockfile 元数据恢复依赖图；
-只有在显式要求 repin 时，才回退到更慢的标准流程。
+信任现有的 `Cargo.lock`，直接从 lockfile 元数据恢复依赖图；显式 repin 时
+也优先留在 fastpath 上：直接用 Cargo 更新或生成 `Cargo.lock`，再由
+fastpath 消费更新后的 lockfile 完成渲染。已有 Bazel `lockfile` 属性仍可继续
+作为 facts 存储位置，但不再是 fastpath 的必需输入。
 
 ## 延伸阅读
 
@@ -19,7 +21,7 @@
 
 这个 backend 主要针对 WORKSPACE 下最常见的稳态场景优化：
 
-- 让现有 `Cargo.lock` 和 Bazel lockfile 保持权威
+- 让现有 `Cargo.lock` 保持权威
 - 普通 `sync` 不再执行 `cargo-bazel query` 和 workspace splice
 - 把昂贵的 registry/manifest facts 持久化，跨 Bazel output root 复用
 - 把每个 crate 的 BUILD 渲染留在 spoke repository，而不是在 hub repository
@@ -54,12 +56,16 @@ WORKSPACE repository rule 兼容。
 
 WORKSPACE fastpath 会在 workspace 根目录维护两层缓存。
 
-`cargo-bazel-lock-fastpath.json`
+`.cargo-bazel-fastpath-cache/facts/<repo>.json`
 
 - 用于保存 fastpath `facts`
 - 当前包含：
   - `registry_entries`：从 sparse index 行裁剪出的 resolver 输入
   - `registry_inspection`：spoke 渲染准备阶段使用的 manifest 子集和源码树探测结果
+  - `workspace_metadata`：same-Cargo-workspace manifest normalization 路径中，
+    已验证的 `cargo metadata --no-deps` 结果
+- 如果显式传入了 `lockfile = "//:..."`，这些 facts 会继续写入该文件，以兼容
+  已迁移的 WORKSPACE 配置
 
 `.cargo-bazel-fastpath-cache/archives`
 
@@ -73,16 +79,28 @@ WORKSPACE fastpath 会在 workspace 根目录维护两层缓存。
 
 fastpath backend 的设计原则是“失败时安全回退”。
 
-- 如果 `cargo-bazel-lock-fastpath.json` 不存在、为空、格式损坏，或者 schema
-  version 不匹配，backend 会忽略它，并从权威输入重新计算 facts。
+- 如果 facts cache 不存在、为空、格式损坏，或者 schema version 不匹配，
+  backend 会忽略它，并从权威输入重新计算 facts。
 - 如果单个 `registry_entries` 或 `registry_inspection` fact 缺失，只会对该 crate
   重新计算，并在结束时重写缓存。
 - 如果某个 archive 文件不存在，会重新下载并回填
   `.cargo-bazel-fastpath-cache/archives`。
 - 如果本地 `path` 或 `git` crate 发生变化，下一次 sync 会重新读取最新的
   Cargo metadata 和 manifest。
-- 如果通过 `CARGO_BAZEL_REPIN=1` 请求 repin，WORKSPACE 会回退到标准 repin
-  流程，而不是继续信任 fastpath cache。
+- 如果 `manifests` 传入多个条目，fastpath 会把它当作
+  same-Cargo-workspace manifest normalization：所有列出的 manifest 都必须是同一个
+  Cargo workspace 的 member manifest，最终从归一后的 workspace root manifest
+  渲染。不支持把多个彼此独立的 Cargo workspace 混在同一个
+  `crates_repository.manifests` 列表里走 fastpath。
+- workspace metadata cache 只有在记录的 `Cargo.lock`、workspace-root
+  manifest，以及每个已记录 workspace member manifest 都仍然匹配当前文件时才会复用。
+  任意一个输入变化时，fastpath 会安全回退到重新执行
+  `cargo metadata --no-deps`，并重写缓存。
+- 如果通过 `CARGO_BAZEL_REPIN=1` 请求 repin，WORKSPACE 默认会走 repin
+  fastpath：直接用 Cargo 更新或生成 `Cargo.lock`，fetch 选中的 crate，按需
+  刷新过期 facts，然后继续用 fastpath 渲染。
+- 对仍需要 cargo-bazel generate 语义的 repin 配置，继续保留 legacy
+  `cargo_bazel` repin/generate fallback。
 
 实际运维上，这意味着缓存始终可以安全删除。删掉任意一层缓存只会让下一次
 sync 变慢，不应该影响正确性。
@@ -122,20 +140,37 @@ sync 变慢，不应该影响正确性。
 `examples/fastpath_regression`
 
 - 面向回归测试的 WORKSPACE example
+- 使用单个 workspace-root manifest，覆盖最简单的 fastpath 输入形态
 - 覆盖 registry、`path`、`git`、`build.rs`、proc-macro、override targets、
   annotation 覆盖面和 render-config 开关
 
 `examples/fastpath_ripgrep`
 
-- 使用本地 `ripgrep` checkout 的隔离式 A/B benchmark harness
-- 同时验证 fastpath workspace 和 baseline `cargo_bazel` workspace
-- 对 warm-cache sync 做 profiling，并报告 steady-state 与 first-generation
-  的耗时
+- 使用本地 `ripgrep` checkout 和隔离生成 WORKSPACE root 的 resolver/sync
+  benchmark
+- baseline 和 fastpath 传入同一组 same-Cargo-workspace member manifests，
+  专门覆盖传统 `cargo_bazel` multi-manifest 项目的兼容性
+- 使用本地 Bazel 化 baseline 和 fastpath ripgrep checkout 的 project
+  end-to-end benchmark
+- 对 warm-cache sync 做 profiling，并为 resolver/sync 和项目级流程报告
+  steady-state 与 first-generation 耗时
 
-最近一次 `examples/fastpath_ripgrep` 基准结果是：
+最近一次 `examples/fastpath_ripgrep` resolver/sync benchmark 结果是：
 
-- steady-state cold sync：`25930ms` 对 `69660ms`（快 `2.686x`）
-- steady-state hot sync：`10730ms` 对 `54280ms`（快 `5.059x`）
-- first-generation repin benchmark：`53110ms` 对 `128950ms`（快 `2.428x`）
+- steady-state cold sync：`24630ms` 对 `71300ms`（快 `2.895x`）
+- steady-state hot sync：`10810ms` 对 `54070ms`（快 `5.002x`）
+- first-generation repin benchmark：`31840ms` 对 `71990ms`（快 `2.261x`）
+
+最近一次 project end-to-end 结果：
+
+- correctness：baseline 和 fastpath 都通过了 `bazel query //...`、
+  `bazel build //...`、`bazel run //:rg -- --version` 和
+  `bazel test //...`
+- steady-state cold `bazel build //...`：`80.95s` 对 `122.24s`
+  real time（快 `1.510x`）
+- steady-state hot `bazel build //...` 中位数：`2.84s` 对 `2.68s`
+  （基本持平）
+- first-generation `CARGO_BAZEL_REPIN=1` sync plus build：`95.48s` 对
+  `137.34s`（快 `1.438x`）
 
 具体数字会受到机器、Bazel 运行模式和缓存温度影响。

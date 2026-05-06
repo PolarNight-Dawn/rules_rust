@@ -47,6 +47,8 @@ crates_repository(
     cargo_lockfile = "//:Cargo.lock",
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
     lockfile = "//:cargo-bazel-lock.json",
+    # Regression coverage uses the simplest supported fastpath input shape:
+    # one workspace-root manifest.
     manifests = ["//:Cargo.toml"],
     resolver_backend = "lockfile_fastpath",
 )
@@ -60,6 +62,8 @@ crates_repository(
     cargo_lockfile = "//:Cargo.lock",
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
     lockfile = "//:cargo-bazel-lock.json",
+    # This is a second repository over the same workspace-root manifest,
+    # used only to exercise render_config toggles.
     manifests = ["//:Cargo.toml"],
     render_config = render_config(
         generate_cargo_toml_env_vars = False,

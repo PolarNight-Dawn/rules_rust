@@ -33,7 +33,7 @@ backend_repo_name() {
 
 backend_lockfile_name() {
   case "$1" in
-    fastpath) printf '%s\n' "cargo-bazel-lock-fastpath.json" ;;
+    fastpath) printf '%s\n' "" ;;
     cargo_bazel) printf '%s\n' "cargo-bazel-lock-cargo-bazel.json" ;;
     *) echo "unknown backend: $1" >&2; exit 1 ;;
   esac
@@ -145,11 +145,15 @@ EOF
 ###############################################################################
 EOF
 
-  cat > "${workspace_dir}/BUILD.bazel" <<EOF
+  if [[ -n "${lockfile_name}" ]]; then
+    cat > "${workspace_dir}/BUILD.bazel" <<EOF
 exports_files(["${lockfile_name}"])
 EOF
 
-  : > "${workspace_dir}/${lockfile_name}"
+    : > "${workspace_dir}/${lockfile_name}"
+  else
+    : > "${workspace_dir}/BUILD.bazel"
+  fi
 }
 
 write_backend_workspace() {
@@ -160,6 +164,8 @@ write_backend_workspace() {
   local target_name
   local generator_line=""
   local backend_attrs=""
+  local lockfile_line=""
+  local bootstrap_arg=""
 
   workspace_dir="$(backend_workspace_dir "${backend}")"
   repo_name="$(backend_repo_name "${backend}")"
@@ -170,6 +176,8 @@ write_backend_workspace() {
 
   if [[ "${backend}" == "cargo_bazel" ]]; then
     generator_line='    generator = "@cargo_bazel_bootstrap//:cargo-bazel",'
+    lockfile_line="    lockfile = \"//:${lockfile_name}\","
+    bootstrap_arg="bootstrap = True"
   else
     backend_attrs='    resolver_backend = "lockfile_fastpath",'
   fi
@@ -191,6 +199,15 @@ new_local_repository(
 exports_files([
     "Cargo.lock",
     "Cargo.toml",
+    "crates/cli/Cargo.toml",
+    "crates/globset/Cargo.toml",
+    "crates/grep/Cargo.toml",
+    "crates/ignore/Cargo.toml",
+    "crates/matcher/Cargo.toml",
+    "crates/pcre2/Cargo.toml",
+    "crates/printer/Cargo.toml",
+    "crates/regex/Cargo.toml",
+    "crates/searcher/Cargo.toml",
 ])
 """,
 )
@@ -205,7 +222,7 @@ rust_register_toolchains(
 
 load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
 
-crate_universe_dependencies(bootstrap = True)
+crate_universe_dependencies(${bootstrap_arg})
 
 load("@rules_rust//crate_universe:defs.bzl", "crates_repository")
 
@@ -213,8 +230,21 @@ crates_repository(
     name = "${repo_name}",
     cargo_lockfile = "@ripgrep//:Cargo.lock",
 ${generator_line}
-    lockfile = "//:${lockfile_name}",
-    manifests = ["@ripgrep//:Cargo.toml"],
+${lockfile_line}
+    # Same-Cargo-workspace manifest normalization coverage: every listed
+    # manifest below is a member of the ripgrep Cargo workspace.
+    manifests = [
+        "@ripgrep//:Cargo.toml",
+        "@ripgrep//:crates/globset/Cargo.toml",
+        "@ripgrep//:crates/grep/Cargo.toml",
+        "@ripgrep//:crates/cli/Cargo.toml",
+        "@ripgrep//:crates/matcher/Cargo.toml",
+        "@ripgrep//:crates/pcre2/Cargo.toml",
+        "@ripgrep//:crates/printer/Cargo.toml",
+        "@ripgrep//:crates/regex/Cargo.toml",
+        "@ripgrep//:crates/searcher/Cargo.toml",
+        "@ripgrep//:crates/ignore/Cargo.toml",
+    ],
 ${backend_attrs}
 )
 
@@ -262,6 +292,15 @@ new_local_repository(
 exports_files([
     "Cargo.lock",
     "Cargo.toml",
+    "crates/cli/Cargo.toml",
+    "crates/globset/Cargo.toml",
+    "crates/grep/Cargo.toml",
+    "crates/ignore/Cargo.toml",
+    "crates/matcher/Cargo.toml",
+    "crates/pcre2/Cargo.toml",
+    "crates/printer/Cargo.toml",
+    "crates/regex/Cargo.toml",
+    "crates/searcher/Cargo.toml",
 ])
 """,
 )
@@ -285,7 +324,19 @@ crates_repository(
     cargo_lockfile = "@ripgrep//:Cargo.lock",
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
     lockfile = "//:cargo-bazel-lock-cargo-bazel.json",
-    manifests = ["@ripgrep//:Cargo.toml"],
+    # Same Cargo workspace manifest set as the fastpath benchmark workspace.
+    manifests = [
+        "@ripgrep//:Cargo.toml",
+        "@ripgrep//:crates/globset/Cargo.toml",
+        "@ripgrep//:crates/grep/Cargo.toml",
+        "@ripgrep//:crates/cli/Cargo.toml",
+        "@ripgrep//:crates/matcher/Cargo.toml",
+        "@ripgrep//:crates/pcre2/Cargo.toml",
+        "@ripgrep//:crates/printer/Cargo.toml",
+        "@ripgrep//:crates/regex/Cargo.toml",
+        "@ripgrep//:crates/searcher/Cargo.toml",
+        "@ripgrep//:crates/ignore/Cargo.toml",
+    ],
 )
 EOF
 }
@@ -293,7 +344,9 @@ EOF
 prepare() {
   ensure_ripgrep_dir "$@"
   mkdir -p "${WORKDIR}"
-  if [[ "${RECREATE_WORKSPACE}" == "1" || ! -f "${FASTPATH_WORKSPACE_DIR}/WORKSPACE.bazel" ]]; then
+  if [[ "${RECREATE_WORKSPACE}" == "1" || ! -f "${FASTPATH_WORKSPACE_DIR}/WORKSPACE.bazel" ]] ||
+     grep -q 'lockfile = "//:cargo-bazel-lock-fastpath.json"' "${FASTPATH_WORKSPACE_DIR}/WORKSPACE.bazel" 2>/dev/null ||
+     grep -q 'generator = "@cargo_bazel_bootstrap//:cargo-bazel"' "${FASTPATH_WORKSPACE_DIR}/WORKSPACE.bazel" 2>/dev/null; then
     write_backend_workspace fastpath
   fi
   if [[ "${RECREATE_WORKSPACE}" == "1" || ! -f "${CARGO_BAZEL_WORKSPACE_DIR}/WORKSPACE.bazel" ]]; then
@@ -311,7 +364,9 @@ reset_backend_lockfile() {
   local lockfile_name
   workspace_dir="$(backend_workspace_dir "${backend}")"
   lockfile_name="$(backend_lockfile_name "${backend}")"
-  : > "${workspace_dir}/${lockfile_name}"
+  if [[ -n "${lockfile_name}" ]]; then
+    : > "${workspace_dir}/${lockfile_name}"
+  fi
   if [[ "${backend}" == "fastpath" ]]; then
     reset_dir "${workspace_dir}/.cargo-bazel-fastpath-cache"
   fi

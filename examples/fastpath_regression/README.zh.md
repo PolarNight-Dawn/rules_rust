@@ -7,6 +7,7 @@
 
 当前覆盖：
 
+- 单个 workspace-root manifest 输入
 - registry crate
 - path crate
 - 通过临时本地 git 仓库提供的 git crate

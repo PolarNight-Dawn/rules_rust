@@ -15,7 +15,7 @@ rust_register_toolchains(
 
 load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
 
-crate_universe_dependencies(bootstrap = True)
+crate_universe_dependencies()
 
 load("@rules_rust//crate_universe:defs.bzl", "crate", "crates_repository")
 
@@ -27,8 +27,7 @@ crates_repository(
         )],
     },
     cargo_lockfile = "//:Cargo.lock",
-    generator = "@cargo_bazel_bootstrap//:cargo-bazel",
-    lockfile = "//:cargo-bazel-lock.json",
+    # Minimal fastpath shape: one workspace-root manifest.
     manifests = ["//:Cargo.toml"],
     resolver_backend = "lockfile_fastpath",
 )

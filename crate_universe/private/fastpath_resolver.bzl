@@ -23,6 +23,7 @@ load(
 _CRATES_IO_INDEX = "registry+https://github.com/rust-lang/crates.io-index"
 _CRATES_IO_SPARSE = "sparse+https://index.crates.io/"
 _FASTPATH_ARCHIVE_CACHE_DIR = ".cargo-bazel-fastpath-cache/archives"
+_FASTPATH_FACTS_CACHE_DIR = ".cargo-bazel-fastpath-cache/facts"
 _FASTPATH_LOCKFILE_FILE = "_fastpath_lockfile.json"
 _FASTPATH_LOCKFILE_VERSION = 1
 _FASTPATH_PROFILE_FILE = "_fastpath_profile.json"
@@ -168,6 +169,7 @@ def _default_fastpath_lockfile():
         "facts": {
             "registry_entries": {},
             "registry_inspection": {},
+            "workspace_metadata": {},
         },
         "version": _FASTPATH_LOCKFILE_VERSION,
     }
@@ -187,6 +189,12 @@ def _workspace_lockfile_path(repository_ctx):
                 path = path.get_child(segment)
     return path.get_child(lockfile.name)
 
+def _workspace_facts_cache_path(repository_ctx):
+    path = repository_ctx.workspace_root
+    for segment in _FASTPATH_FACTS_CACHE_DIR.split("/"):
+        path = path.get_child(segment)
+    return path.get_child("{}.json".format(repository_ctx.name))
+
 def _workspace_archive_cache_path(repository_ctx, crate_name, version, checksum):
     path = repository_ctx.workspace_root
     for segment in _FASTPATH_ARCHIVE_CACHE_DIR.split("/"):
@@ -197,7 +205,9 @@ def _fastpath_lockfile_path(repository_ctx):
     workspace_lockfile = _workspace_lockfile_path(repository_ctx)
     if workspace_lockfile:
         return workspace_lockfile
-    return repository_ctx.path(repository_ctx.attr.lockfile)
+    if repository_ctx.attr.lockfile:
+        return repository_ctx.path(repository_ctx.attr.lockfile)
+    return _workspace_facts_cache_path(repository_ctx)
 
 def _load_fastpath_lockfile(repository_ctx):
     lockfile = _default_fastpath_lockfile()
@@ -219,10 +229,14 @@ def _load_fastpath_lockfile(repository_ctx):
 
     lockfile["facts"]["registry_entries"] = dict(facts.get("registry_entries", {}))
     lockfile["facts"]["registry_inspection"] = dict(facts.get("registry_inspection", {}))
+    lockfile["facts"]["workspace_metadata"] = dict(facts.get("workspace_metadata", {}))
     return lockfile
 
 def _write_fastpath_lockfile(repository_ctx, lockfile):
-    content = json.encode_indent(lockfile, indent = "    ") + "\n"
+    content_lockfile = _clone_jsonish(lockfile)
+    if repository_ctx.attr.lockfile:
+        content_lockfile["facts"].pop("workspace_metadata", None)
+    content = json.encode_indent(content_lockfile, indent = "    ") + "\n"
     lockfile_path = _fastpath_lockfile_path(repository_ctx)
     existing = ""
     if lockfile_path.exists:
@@ -248,8 +262,11 @@ def _write_fastpath_lockfile(repository_ctx, lockfile):
 def _registry_entry_fact_key(source, crate_name, version):
     return "{}|{}|{}".format(_normalize_registry_source(source), crate_name, version)
 
-def _registry_inspection_fact_key(source, crate_name, version):
-    return "{}|{}|{}".format(_normalize_registry_source(source), crate_name, version)
+def _registry_inspection_fact_key(source, crate_name, version, checksum):
+    key = "{}|{}|{}".format(_normalize_registry_source(source), crate_name, version)
+    if checksum:
+        key += "|{}".format(checksum)
+    return key
 
 def _clone_jsonish(value):
     return json.decode(json.encode(value))
@@ -1309,6 +1326,8 @@ def _download_registry_metadata(repository_ctx, packages, fastpath_lockfile):
     registry_entry_facts = fastpath_lockfile["facts"]["registry_entries"]
     cache_hits = 0
     cache_misses = 0
+    fetches = []
+
     for package in packages:
         source = _normalize_registry_source(package["source"])
         key = "{}|{}".format(source, package["name"])
@@ -1337,32 +1356,45 @@ def _download_registry_metadata(repository_ctx, packages, fastpath_lockfile):
                 len(metadata_by_source_and_name),
                 package["name"],
             ))
-            repository_ctx.download(
+            token = repository_ctx.download(
+                block = False,
                 output = output,
                 url = source.removeprefix("sparse+") + _sharded_path(package["name"].lower()),
             )
-            for line in repository_ctx.read(output).splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.decode(line)
-                version = entry["vers"]
-                if version not in missing_versions:
-                    continue
-                features = dict(entry.get("features", {}))
-                features2 = entry.get("features2")
-                if features2:
-                    features.update(features2)
-                fact = {
-                    "checksum": entry["cksum"],
-                    "dependencies": entry.get("deps", []),
-                    "features": features,
-                    "links": entry.get("links"),
-                }
-                entries[version] = _clone_jsonish(fact)
-                registry_entry_facts[_registry_entry_fact_key(source, package["name"], version)] = _clone_jsonish(fact)
+            fetches.append(struct(
+                entries = entries,
+                missing_versions = missing_versions,
+                name = package["name"],
+                output = output,
+                source = source,
+                token = token,
+            ))
 
         metadata_by_source_and_name[key] = entries
+
+    for fetch in fetches:
+        fetch.token.wait()
+        for line in repository_ctx.read(fetch.output).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.decode(line)
+            version = entry["vers"]
+            if version not in fetch.missing_versions:
+                continue
+            features = dict(entry.get("features", {}))
+            features2 = entry.get("features2")
+            if features2:
+                features.update(features2)
+            fact = {
+                "checksum": entry["cksum"],
+                "dependencies": entry.get("deps", []),
+                "features": features,
+                "links": entry.get("links"),
+            }
+            fetch.entries[version] = _clone_jsonish(fact)
+            registry_entry_facts[_registry_entry_fact_key(fetch.source, fetch.name, version)] = _clone_jsonish(fact)
+
     return struct(
         cache_hits = cache_hits,
         cache_misses = cache_misses,
@@ -1479,6 +1511,12 @@ def _dict_value(common, selects):
         branches["@rules_rust//rust/platform:" + triple.replace("-musl", "-gnu").replace("-gnullvm", "-msvc")] = merged
     return select(branches)
 
+def _label_keyed_aliases(aliases):
+    return {{
+        label: alias
+        for alias, label in aliases.items()
+    }}
+
 def aliases(
         normal = False,
         normal_dev = False,
@@ -1504,6 +1542,11 @@ def aliases(
             existing.update(values)
             selects[triple] = existing
 
+    common = _label_keyed_aliases(common)
+    selects = {{
+        triple: _label_keyed_aliases(values)
+        for triple, values in selects.items()
+    }}
     return _dict_value(common, selects)
 
 def all_crate_deps(
@@ -1623,46 +1666,255 @@ def _feature_resolutions_render_metadata(feature_resolutions, platform_triples):
         },
     }
 
+def _cargo_metadata_no_deps(repository_ctx, cargo_path, rustc_path, manifest_path, locked = True, allow_fail = False):
+    args = [
+        cargo_path,
+        "metadata",
+        "--format-version",
+        "1",
+    ]
+    if locked:
+        args.append("--locked")
+    args.extend([
+        "--no-deps",
+        "--manifest-path",
+        manifest_path,
+    ])
+
+    result = execute(
+        repository_ctx,
+        args = args,
+        env = {
+            "CARGO": str(cargo_path),
+            "RUSTC": str(rustc_path),
+        } | cargo_environ(repository_ctx, isolated = repository_ctx.attr.isolated),
+        allow_fail = allow_fail,
+        quiet = not repository_ctx.os.environ.get(CARGO_BAZEL_DEBUG),
+    )
+    if result.return_code:
+        return None
+
+    return json.decode(result.stdout)
+
+def _manifest_label_relative_path(manifest):
+    label = str(manifest)
+    _, _, label_body = label.partition("//")
+    package, _, name = label_body.partition(":")
+    if package:
+        return "{}/{}".format(package, name)
+    return name
+
+def _workspace_metadata_fact_key(repository_ctx, locked):
+    return "{}|{}".format(
+        "locked" if locked else "unlocked",
+        "|".join([str(manifest) for manifest in repository_ctx.attr.manifests]),
+    )
+
+def _workspace_manifest_path(repository_ctx, workspace_root, relative_manifest):
+    return repository_ctx.path("{}/{}".format(workspace_root, relative_manifest))
+
+def _read_workspace_manifest_contents(repository_ctx, workspace_root, relative_manifests):
+    manifest_contents = {}
+    for relative_manifest in sorted(relative_manifests):
+        manifest_path = _workspace_manifest_path(repository_ctx, workspace_root, relative_manifest)
+        if not manifest_path.exists:
+            return None
+        manifest_contents[relative_manifest] = repository_ctx.read(manifest_path)
+    return manifest_contents
+
+def _cached_normalized_manifest(repository_ctx, fastpath_lockfile, cargo_lock_content, locked):
+    if fastpath_lockfile == None or cargo_lock_content == None or not locked or repository_ctx.attr.lockfile:
+        return None
+
+    fact = fastpath_lockfile["facts"]["workspace_metadata"].get(_workspace_metadata_fact_key(repository_ctx, locked))
+    if not fact:
+        return None
+
+    input_manifest_labels = [str(manifest) for manifest in repository_ctx.attr.manifests]
+    if fact.get("input_manifest_labels") != input_manifest_labels:
+        return None
+    if fact.get("cargo_lock_content") != cargo_lock_content:
+        return None
+
+    workspace_root = fact.get("workspace_root")
+    manifest_contents = fact.get("manifest_contents")
+    manifest_path = fact.get("manifest_path")
+    cargo_metadata = fact.get("cargo_metadata")
+    if not workspace_root or type(manifest_contents) != "dict" or not manifest_path or type(cargo_metadata) != "dict":
+        return None
+
+    for relative_manifest, expected_content in manifest_contents.items():
+        current_manifest_path = _workspace_manifest_path(repository_ctx, workspace_root, relative_manifest)
+        if not current_manifest_path.exists:
+            return None
+        if repository_ctx.read(current_manifest_path) != expected_content:
+            return None
+
+    normalized_manifest_path = repository_ctx.path(manifest_path)
+    if not normalized_manifest_path.exists:
+        return None
+
+    return struct(
+        cache_hit = True,
+        cargo_metadata = cargo_metadata,
+        input_manifest_count = fact.get("input_manifest_count", len(repository_ctx.attr.manifests)),
+        manifest_path = normalized_manifest_path,
+    )
+
+def _store_normalized_manifest(repository_ctx, fastpath_lockfile, cargo_lock_content, locked, normalized_manifest, workspace_root, relative_manifests):
+    if fastpath_lockfile == None or cargo_lock_content == None or not locked or repository_ctx.attr.lockfile:
+        return
+
+    manifest_contents = _read_workspace_manifest_contents(
+        repository_ctx = repository_ctx,
+        workspace_root = workspace_root,
+        relative_manifests = relative_manifests,
+    )
+    if manifest_contents == None:
+        return
+
+    fastpath_lockfile["facts"]["workspace_metadata"][_workspace_metadata_fact_key(repository_ctx, locked)] = {
+        "cargo_lock_content": cargo_lock_content,
+        "cargo_metadata": _clone_jsonish(normalized_manifest.cargo_metadata),
+        "input_manifest_count": normalized_manifest.input_manifest_count,
+        "input_manifest_labels": [str(manifest) for manifest in repository_ctx.attr.manifests],
+        "manifest_contents": manifest_contents,
+        "manifest_path": str(normalized_manifest.manifest_path),
+        "workspace_root": workspace_root,
+    }
+
+def normalize_fastpath_workspace_manifest(
+        repository_ctx,
+        cargo_path,
+        rustc_path,
+        locked = True,
+        fail_on_unsupported = True,
+        fastpath_lockfile = None,
+        cargo_lock_content = None):
+    if repository_ctx.attr.packages:
+        if fail_on_unsupported:
+            fail("`resolver_backend = \"lockfile_fastpath\"` currently supports WORKSPACE manifest flows only; `packages` is not supported yet.")
+        return None
+    if not repository_ctx.attr.manifests:
+        if fail_on_unsupported:
+            fail("`resolver_backend = \"lockfile_fastpath\"` requires at least one manifest.")
+        return None
+
+    cached_manifest = _cached_normalized_manifest(
+        repository_ctx = repository_ctx,
+        fastpath_lockfile = fastpath_lockfile,
+        cargo_lock_content = cargo_lock_content,
+        locked = locked,
+    )
+    if cached_manifest != None:
+        return cached_manifest
+
+    first_manifest_path = repository_ctx.path(repository_ctx.attr.manifests[0])
+    first_metadata = _cargo_metadata_no_deps(
+        repository_ctx = repository_ctx,
+        cargo_path = cargo_path,
+        rustc_path = rustc_path,
+        manifest_path = first_manifest_path,
+        locked = locked,
+        allow_fail = not fail_on_unsupported,
+    )
+    if first_metadata == None:
+        return None
+
+    workspace_root = first_metadata.get("workspace_root")
+    if not workspace_root:
+        if fail_on_unsupported:
+            fail("Cargo metadata for {} did not report a workspace root.".format(first_manifest_path))
+        return None
+
+    workspace_member_package_ids = {
+        package_id: True
+        for package_id in first_metadata.get("workspace_members", [])
+    }
+    workspace_member_manifests = {
+        _relative_to_workspace(package["manifest_path"], workspace_root): True
+        for package in first_metadata.get("packages", [])
+        if package.get("id") in workspace_member_package_ids
+    }
+
+    workspace_manifest = None
+    for manifest in repository_ctx.attr.manifests:
+        relative_manifest = _manifest_label_relative_path(manifest)
+        if relative_manifest == "Cargo.toml":
+            workspace_manifest = manifest
+        if relative_manifest not in workspace_member_manifests:
+            if fail_on_unsupported:
+                fail(
+                    "`resolver_backend = \"lockfile_fastpath\"` only supports multiple manifests " +
+                    "when they normalize to the same Cargo workspace root. {} was not reported " +
+                    "as a workspace member under {}.".format(manifest, workspace_root),
+                )
+            return None
+
+    if workspace_manifest:
+        workspace_manifest_path = repository_ctx.path(workspace_manifest)
+    else:
+        workspace_manifest_path = repository_ctx.path("{}/Cargo.toml".format(workspace_root))
+
+    cargo_metadata = first_metadata
+    if str(workspace_manifest_path) != str(first_manifest_path):
+        cargo_metadata = _cargo_metadata_no_deps(
+            repository_ctx = repository_ctx,
+            cargo_path = cargo_path,
+            rustc_path = rustc_path,
+            manifest_path = workspace_manifest_path,
+            locked = locked,
+            allow_fail = not fail_on_unsupported,
+        )
+        if cargo_metadata == None:
+            return None
+
+    relative_manifests_to_track = dict(workspace_member_manifests)
+    relative_manifests_to_track[_relative_to_workspace(str(workspace_manifest_path), workspace_root)] = True
+
+    normalized_manifest = struct(
+        cache_hit = False,
+        cargo_metadata = cargo_metadata,
+        input_manifest_count = len(repository_ctx.attr.manifests),
+        manifest_path = workspace_manifest_path,
+    )
+    _store_normalized_manifest(
+        repository_ctx = repository_ctx,
+        fastpath_lockfile = fastpath_lockfile,
+        cargo_lock_content = cargo_lock_content,
+        locked = locked,
+        normalized_manifest = normalized_manifest,
+        workspace_root = workspace_root,
+        relative_manifests = relative_manifests_to_track.keys(),
+    )
+    return normalized_manifest
+
 def fastpath_resolve_and_render(repository_ctx, cargo_path, cargo_lockfile_path, rustc_path):
     """Resolve external crates from Cargo.lock and render hub/spoke data."""
 
-    if repository_ctx.attr.packages:
-        fail("`resolver_backend = \"lockfile_fastpath\"` currently supports WORKSPACE manifest flows only; `packages` is not supported yet.")
-    if not repository_ctx.attr.manifests:
-        fail("`resolver_backend = \"lockfile_fastpath\"` requires at least one manifest.")
-    if len(repository_ctx.attr.manifests) != 1:
-        fail("`resolver_backend = \"lockfile_fastpath\"` currently supports exactly one workspace root manifest.")
-
-    manifest_path = repository_ctx.path(repository_ctx.attr.manifests[0])
     cargo_lock_content = repository_ctx.read(cargo_lockfile_path)
     profiler = _new_fastpath_profiler(repository_ctx)
     fastpath_lockfile = _load_fastpath_lockfile(repository_ctx)
 
     phase_started_ns = _fastpath_profile_start(repository_ctx, profiler)
-    cargo_metadata = json.decode(execute(
-        repository_ctx,
-        args = [
-            cargo_path,
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--no-deps",
-            "--manifest-path",
-            manifest_path,
-        ],
-        env = {
-            "CARGO": str(cargo_path),
-            "RUSTC": str(rustc_path),
-        } | cargo_environ(repository_ctx, isolated = repository_ctx.attr.isolated),
-        quiet = not repository_ctx.os.environ.get(CARGO_BAZEL_DEBUG),
-    ).stdout)
+    normalized_manifest = normalize_fastpath_workspace_manifest(
+        repository_ctx = repository_ctx,
+        cargo_path = cargo_path,
+        rustc_path = rustc_path,
+        locked = True,
+        fastpath_lockfile = fastpath_lockfile,
+        cargo_lock_content = cargo_lock_content,
+    )
+    manifest_path = normalized_manifest.manifest_path
+    cargo_metadata = normalized_manifest.cargo_metadata
     _fastpath_profile_record(
         repository_ctx,
         profiler,
         "cargo_metadata_no_deps",
         phase_started_ns,
         details = {
+            "cache_hit": normalized_manifest.cache_hit,
+            "input_manifests": normalized_manifest.input_manifest_count,
             "workspace_members": len(cargo_metadata.get("workspace_members", [])),
         },
     )
@@ -2005,6 +2257,32 @@ def fastpath_resolve_and_render(repository_ctx, cargo_path, cargo_lockfile_path,
     tar_binary = _tar_binary(repository_ctx)
     inspection_cache_hits = 0
     inspection_cache_misses = 0
+    registry_archive_fetches_by_fq = {}
+
+    for package in external_packages:
+        if not package["source"].startswith("sparse+"):
+            continue
+
+        crate_name = package["name"]
+        version = package["version"]
+        checksum = package["checksum"]
+        archive_path = _workspace_archive_cache_path(repository_ctx, crate_name, version, checksum)
+        if archive_path.exists:
+            continue
+
+        repo_name = _spoke_repo_name(repository_ctx.name, crate_name, version)
+        archive_rel = "_fastpath_archive/{}.tar.gz".format(repo_name)
+        download_path = repository_ctx.path(archive_rel)
+        registry_archive_fetches_by_fq[_fq_crate(crate_name, version)] = struct(
+            archive_path = archive_path,
+            download_path = download_path,
+            token = repository_ctx.download(
+                block = False,
+                output = download_path,
+                sha256 = checksum,
+                url = _crate_archive_url(crate_name, version, package["source"], registry_dl_templates, checksum = checksum),
+            ),
+        )
 
     phase_started_ns = _fastpath_profile_start(repository_ctx, profiler)
     for package in external_packages:
@@ -2017,14 +2295,9 @@ def fastpath_resolve_and_render(repository_ctx, cargo_path, cargo_lockfile_path,
         if package["source"].startswith("sparse+"):
             archive_url = _crate_archive_url(crate_name, version, package["source"], registry_dl_templates, checksum = package["checksum"])
             archive_path = _workspace_archive_cache_path(repository_ctx, crate_name, version, package["checksum"])
-            if not archive_path.exists:
-                archive_rel = "_fastpath_archive/{}.tar.gz".format(repo_name)
-                download_path = repository_ctx.path(archive_rel)
-                repository_ctx.download(
-                    output = download_path,
-                    sha256 = package["checksum"],
-                    url = archive_url,
-                )
+            archive_fetch = registry_archive_fetches_by_fq.get(fq)
+            if archive_fetch:
+                archive_fetch.token.wait()
                 execute(
                     repository_ctx,
                     args = [
@@ -2032,13 +2305,18 @@ def fastpath_resolve_and_render(repository_ctx, cargo_path, cargo_lockfile_path,
                         "-c",
                         'mkdir -p "$1" && cp "$2" "$3"',
                         "sh",
-                        str(archive_path.dirname),
-                        str(download_path),
-                        str(archive_path),
+                        str(archive_fetch.archive_path.dirname),
+                        str(archive_fetch.download_path),
+                        str(archive_fetch.archive_path),
                     ],
                     quiet = True,
                 )
-            inspection_fact_key = _registry_inspection_fact_key(package["source"], crate_name, version)
+            inspection_fact_key = _registry_inspection_fact_key(
+                package["source"],
+                crate_name,
+                version,
+                "" if repository_ctx.attr.lockfile else package["checksum"],
+            )
             inspection_fact = fastpath_lockfile["facts"]["registry_inspection"].get(inspection_fact_key)
             if inspection_fact:
                 inspection_cache_hits += 1
@@ -2348,6 +2626,7 @@ alias(
             "registry_entry_cache_entries": len(fastpath_lockfile["facts"]["registry_entries"]),
             "registry_packages": len(registry_packages),
             "repository_rules": len(repositories),
+            "workspace_metadata_cache_entries": len(fastpath_lockfile["facts"]["workspace_metadata"]),
             "workspace_packages": len(workspace_packages),
         },
     )
